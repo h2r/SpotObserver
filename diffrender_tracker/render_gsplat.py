@@ -12,11 +12,16 @@ gsplat is CUDA-only, so this runs on the 3080, not the Mac dev box. The gaussian
 (means/quats/scales/opacities/colors) already matches gsplat.rasterization's arg layout;
 the camera is OpenCV-convention so K/viewmat drop straight in.
 
-Compositing note (kept faithful to the validated soft splatter): gsplat's RGB and D
-channels are alpha-ACCUMULATED (sum of transmittance*alpha*value), not normalized. The
-soft splatter returns the alpha-NORMALIZED expected color/depth (color_num/weight). To
-match that semantics exactly we divide both the color and depth channels by alpha here.
-Loss/health-check thresholds calibrated on the soft splatter therefore transfer directly.
+Compositing (tuned on the 4060 via diag_gsplat.py, NOT blindly matched to the soft
+splatter): gsplat's RGB/D channels are alpha-ACCUMULATED (sum of transmittance*alpha*value).
+  * COLOR is left RAW (accumulated, composited over black) — this is what the pose optimizer
+    minimizes. Alpha-NORMALIZING it (color/alpha = "expected color") looked more faithful to
+    the soft splatter but injected high-frequency noise at low-alpha silhouette pixels that
+    trapped the solver: from 9deg it stalled at ~7deg normalized vs converged to ~0.2deg raw.
+    So we optimize on the smooth raw-composited image. Env DIFFRENDER_GSPLAT_NORMALIZE=1
+    restores the old normalized-color behavior for comparison.
+  * DEPTH is alpha-NORMALIZED (expected depth) — it's only a validator (§4.3), never in the
+    optimizer path, so we keep it in metric units.
 """
 
 import os
@@ -26,10 +31,10 @@ import torch
 _rasterization = None
 
 
-def _normalize_enabled():
-    """Whether to divide color/depth by alpha (expected-value, matches soft splatter).
-    Toggle with env DIFFRENDER_GSPLAT_NORMALIZE=0 to compare against raw gsplat compositing."""
-    return os.environ.get("DIFFRENDER_GSPLAT_NORMALIZE", "1").strip().lower() not in ("0", "false", "no")
+def _normalize_color():
+    """Default False: optimize on RAW gsplat compositing (smoother pose landscape). Set env
+    DIFFRENDER_GSPLAT_NORMALIZE=1 to divide color by alpha (old expected-color behavior)."""
+    return os.environ.get("DIFFRENDER_GSPLAT_NORMALIZE", "0").strip().lower() in ("1", "true", "yes")
 
 
 def _get_rasterization():
@@ -90,11 +95,7 @@ def render_gsplat(gaussians, camera, transform=None, eps=1e-8,
 
     out = render_colors[0]                     # (H,W,4): RGB (accumulated) + D (accumulated)
     alpha = render_alphas[0, ..., 0]           # (H,W): accumulated coverage
-    if _normalize_enabled():
-        denom = alpha.clamp_min(eps)
-        image = out[..., :3] / denom[..., None]   # -> expected color (matches soft splatter)
-        depth = out[..., 3] / denom               # -> expected depth  (matches soft splatter)
-    else:
-        image = out[..., :3]                      # raw gsplat compositing over black bg
-        depth = out[..., 3]
+    denom = alpha.clamp_min(eps)
+    image = out[..., :3] / denom[..., None] if _normalize_color() else out[..., :3]
+    depth = out[..., 3] / denom                # expected (metric) depth — validator only
     return {"image": image, "alpha": alpha, "depth": depth}

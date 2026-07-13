@@ -82,12 +82,13 @@ def main():
                            dtype=torch.float32, device=device)
     T_init = (T_gt @ se3_exp(perturb)).detach()
     r0, t0 = pose_error(T_init, T_gt)
+    rig = VirtualCamera.rig_overlap(gA["means"], gB["means"], device=device)   # 3-cam rig
     os.environ["DIFFRENDER_BACKEND"] = "gsplat"              # force gsplat inside run_fit
-    T_final, hist = run_fit(gA, gB, T_gt, cam, T_init, pyramid=PYRAMID,
+    T_final, hist = run_fit(gA, gB, T_gt, rig, T_init, pyramid=PYRAMID,
                             lr=0.02, affine=True, device=device)
     rf, tf = pose_error(T_final, T_gt)
     ok = (rf < 0.5) and (tf < 0.01)
-    print("3. CONVERGE (cold solve through gsplat, coarse-to-fine)")
+    print("3. CONVERGE (cold solve through gsplat, 3-cam rig, coarse-to-fine)")
     print(f"   start {r0:.2f} deg / {t0*100:.1f} cm  ->  final {rf:.3f} deg / {tf*100:.2f} cm")
     print(f"   ACCEPTANCE (<0.5 deg & <1 cm): {'PASS' if ok else 'FAIL'}")
 

@@ -35,14 +35,18 @@ MOTION_ROT = (1.0, 0.8, -1.2)               # per-frame relative motion (deg) ~1
 MOTION_TRANS = (0.020, -0.015, 0.015)       # per-frame relative motion (m) ~0.03 m
 
 
-def solve_frame(gB_k, cam, target, T_init, steps=STEPS, lr=LR):
-    """Few gradient steps from T_init. Returns (T_est, n_steps)."""
+def solve_frame(gB_k, cams, targets, T_init, steps=STEPS, lr=LR):
+    """Few gradient steps from T_init, photometric loss SUMMED over the camera rig
+    (multi-view breaks the single-camera depth-degeneracy). Returns T_est."""
     xi = torch.zeros(6, requires_grad=True)
     opt = torch.optim.Adam([xi], lr=lr)
     for _ in range(steps):
         opt.zero_grad()
         T = T_init @ se3_exp(xi)
-        loss, _ = photometric_loss(render(gB_k, cam, transform=T), target, affine=True)
+        loss = 0.0
+        for c, tgt in zip(cams, targets):
+            l, _ = photometric_loss(render(gB_k, c, transform=T), tgt, affine=True)
+            loss = loss + l
         loss.backward()
         opt.step()
     return (T_init @ se3_exp(xi)).detach()
@@ -52,10 +56,10 @@ def main():
     gA = load_cloud_gaussians(os.path.join(DATA, "cloud_A.npz"))
     gB = load_cloud_gaussians(os.path.join(DATA, "cloud_B.npz"))
     T_gt = torch.as_tensor(np.load(os.path.join(DATA, "cloud_B.npz"))["T_gt"], dtype=torch.float32)
-    cam = VirtualCamera.place_overlap(gA["means"], gB["means"])
+    cams = VirtualCamera.rig_overlap(gA["means"], gB["means"])
 
     with torch.no_grad():
-        target = {k: v.detach() for k, v in render(gA, cam).items()}
+        targets = [{k: v.detach() for k, v in render(gA, c).items()} for c in cams]
         B_world = gB["means"] @ T_gt[:3, :3].T + T_gt[:3, 3]     # B's points in world/A frame
 
     delta = se3_exp(perturb_twist(MOTION_ROT, MOTION_TRANS))
@@ -70,9 +74,9 @@ def main():
         gB_k = dict(gB, means=(B_world - tk) @ Rk)               # regenerate B in its frame-k pose
 
         t0 = time.time()
-        est_warm = solve_frame(gB_k, cam, target, T_init=est_warm)   # warm: from last estimate
+        est_warm = solve_frame(gB_k, cams, targets, T_init=est_warm)   # warm: from last estimate
         dt = time.time() - t0
-        est_cold = solve_frame(gB_k, cam, target, T_init=T_gt)       # cold: from fixed pose
+        est_cold = solve_frame(gB_k, cams, targets, T_init=T_gt)       # cold: from fixed pose
 
         rw, tw = pose_error(est_warm, T_true)
         rc, tc = pose_error(est_cold, T_true)

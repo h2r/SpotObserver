@@ -95,22 +95,22 @@ def main():
     section_A(cam, gA)
 
     BIG = ((5.0, 5.0, -6.0), (0.10, -0.08, 0.06))     # ~9.3 deg / 14 cm  (bootstrap regime)
+    MID = ((3.0, 3.0, -3.5), (0.05, -0.04, 0.04))      # ~5 deg / 8 cm    (edge of warm budget)
     SMALL = ((1.5, 1.5, -2.0), (0.03, -0.02, 0.02))    # ~3 deg / 4 cm    (warm-start regime)
-    PYR = [(0.25, 70), (0.5, 70), (1.0, 90)]
-    FULL = [(1.0, 250)]
+    FULL = [(1.0, 300)]
 
-    print("\nB. CONVERGE matrix (all through gsplat)")
-    conv("pyramid,  mult1.5, from 9deg", 1.5, PYR, *BIG)
-    conv("fullres,  mult1.5, from 9deg", 1.5, FULL, *BIG)
-    conv("fullres,  mult1.5, from 3deg", 1.5, FULL, *SMALL)
-    conv("fullres,  mult0.6, from 9deg", 0.6, FULL, *BIG)
-    conv("fullres,  mult0.6, from 3deg", 0.6, FULL, *SMALL)
-    conv("pyramid,  mult0.6, from 9deg", 0.6, PYR, *BIG)
+    # Default renderer is now RAW color (norm off). Soft needs mult>=1.0 (holes below);
+    # find a scale where gsplat-raw ALSO converges -> one shared scale for both backends.
+    print("\nB. CONVERGE matrix (gsplat, RAW color = new default)")
+    for m in (0.6, 1.0, 1.5):
+        conv(f"fullres, mult{m}, from 9deg", m, FULL, *BIG)
+        conv(f"fullres, mult{m}, from 5deg", m, FULL, *MID)
+        conv(f"fullres, mult{m}, from 3deg", m, FULL, *SMALL)
 
-    print("\n   (normalize-off control, raw gsplat compositing)")
-    os.environ["DIFFRENDER_GSPLAT_NORMALIZE"] = "0"
-    conv("fullres,  mult0.6, from 9deg [norm off]", 0.6, FULL, *BIG)
+    print("\n   (normalize-ON control at the soft-friendly scale, to reconfirm raw is better)")
     os.environ["DIFFRENDER_GSPLAT_NORMALIZE"] = "1"
+    conv("fullres, mult1.0, from 9deg [norm ON]", 1.0, FULL, *BIG)
+    os.environ["DIFFRENDER_GSPLAT_NORMALIZE"] = "0"
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ def estimate_spacing(means, sample=2000):
     return d.min(dim=1).values.median().item()
 
 
-def cloud_to_gaussians(xyz, rgb, scale=None, scale_mult=1.5, opacity=0.99,
+def cloud_to_gaussians(xyz, rgb, scale=None, scale_mult=1.0, opacity=0.99,
                        device="cpu", dtype=torch.float32):
     """
     xyz: (N,3) array/tensor of point positions (metres).

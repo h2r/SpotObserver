@@ -82,6 +82,30 @@ class VirtualCamera:
         return cls.look_at(eye.tolist(), center.tolist(), up=(0, 0, 1),
                            fov_deg=fov_deg, width=width, height=height, device=device)
 
+    @classmethod
+    def rig_overlap(cls, means_a, means_b, azimuths=(-50.0, 0.0, 50.0), margin=1.6,
+                    fov_deg=60.0, width=640, height=480, device="cpu"):
+        """A RING of cameras around the overlap centroid at the given azimuths (deg; 0 == the
+        single `place_overlap` view along +y). Multiple views break the depth-degeneracy of a
+        photometric loss: motion along one camera's optical axis (which that camera can't see)
+        is in-plane and well-constrained for another. Validated on the 4060 — a single camera
+        floors translation at ~2.5cm along its view axis; this 3-cam rig converges to <0.7cm
+        (brief §7.4). Returns a list[VirtualCamera]; feed it straight to run_fit/solve_frame."""
+        a, b = _as_cpu_f32(means_a), _as_cpu_f32(means_b)
+        lo = torch.maximum(a.min(0).values, b.min(0).values)
+        hi = torch.minimum(a.max(0).values, b.max(0).values)
+        center = 0.5 * (lo + hi)
+        extent = (hi - lo).max().item()
+        cams = []
+        for az in azimuths:
+            th = np.deg2rad(az)
+            d = np.array([np.sin(th), np.cos(th), 0.0])          # 0deg -> +y, like place_overlap
+            eye = center.numpy().astype(np.float64) + margin * extent * d
+            eye[2] = center[2].item() + 0.3 * extent
+            cams.append(cls.look_at(eye.tolist(), center.tolist(), up=(0, 0, 1),
+                                    fov_deg=fov_deg, width=width, height=height, device=device))
+        return cams
+
     def scaled(self, factor):
         """A lower-resolution copy of this camera (same viewpoint) for coarse-to-fine."""
         w = max(1, int(round(self.width * factor)))

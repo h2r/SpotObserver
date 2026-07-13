@@ -23,7 +23,7 @@ from gaussians import load_cloud_gaussians
 from camera import VirtualCamera
 from render import render
 from se3 import se3_exp, pose_error
-from loss import photometric_loss
+from tracker_core import run_fit
 
 DATA = os.path.join(os.path.dirname(__file__), "data")
 
@@ -42,43 +42,24 @@ def main():
     gB = load_cloud_gaussians(os.path.join(DATA, "cloud_B.npz"), device=device)
     T_gt = torch.as_tensor(np.load(os.path.join(DATA, "cloud_B.npz"))["T_gt"],
                            dtype=torch.float32, device=device)
-    cam_full = VirtualCamera.place_overlap(gA["means"], gB["means"], device=device)
+    rig = VirtualCamera.rig_overlap(gA["means"], gB["means"], device=device)   # 3-cam rig
 
     # initial guess = T_gt pushed off by a known perturbation
     perturb = torch.tensor([*PERTURB_TRANS, *np.deg2rad(PERTURB_ROT_DEG)],
                            dtype=torch.float32, device=device)
     T_init = (T_gt @ se3_exp(perturb)).detach()
 
-    xi = torch.zeros(6, device=device, requires_grad=True)
-    opt = torch.optim.Adam([xi], lr=LR)
-
     r0, t0 = pose_error(T_init, T_gt)
     print(f"start error: {r0:.2f} deg, {t0*100:.1f} cm")
 
-    hist = {"loss": [], "rot": [], "trans": [], "cov": []}
-    for scale, iters in PYRAMID:
-        cam = cam_full if scale >= 1.0 else cam_full.scaled(scale)
-        with torch.no_grad():
-            targetA = render(gA, cam)
-            targetA = {k: v.detach() for k, v in targetA.items()}
-        for _ in range(iters):
-            opt.zero_grad()
-            T = T_init @ se3_exp(xi)
-            rB = render(gB, cam, transform=T)
-            loss, info = photometric_loss(rB, targetA, affine=AFFINE)
-            loss.backward()
-            opt.step()
-            rot, tr = pose_error((T_init @ se3_exp(xi)).detach(), T_gt)
-            hist["loss"].append(loss.item()); hist["rot"].append(rot)
-            hist["trans"].append(tr); hist["cov"].append(info["coverage"])
-
-    T_final = (T_init @ se3_exp(xi)).detach()
+    T_final, hist = run_fit(gA, gB, T_gt, rig, T_init, pyramid=PYRAMID, lr=LR,
+                            affine=AFFINE, device=device)
     rf, tf = pose_error(T_final, T_gt)
     print(f"final error: {rf:.2f} deg, {tf*100:.2f} cm")
     print(f"rotation:    {r0:.2f} -> {rf:.2f} deg   ({r0/max(rf,1e-6):.0f}x reduction)")
     print(f"translation: {t0*100:.1f} -> {tf*100:.2f} cm ({t0/max(tf,1e-9):.0f}x reduction)")
 
-    _plot(gA, gB, cam_full, T_init, T_final, hist, r0, t0, rf, tf)
+    _plot(gA, gB, rig[1], T_init, T_final, hist, r0, t0, rf, tf)   # rig[1] = centre view (az 0)
 
 
 def _plot(gA, gB, cam, T_init, T_final, hist, r0, t0, rf, tf):
