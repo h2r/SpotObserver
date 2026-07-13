@@ -24,10 +24,12 @@ from .stitch import (
     STITCH_OUT_H,
     STITCH_OUT_W,
     CamStitchParams,
+    attach_fisheye_calibration,
     compute_stitch,
     extract_btw_params,
     extract_ctb_params,
     extract_stitch_params,
+    load_fisheye_calibration,
 )
 
 if TYPE_CHECKING:
@@ -894,6 +896,28 @@ class SpotCamStream:
         fr_sdk_i = self._sdk_camera_order.index(CameraType.FRONTRIGHT)
         self._stitch_params_l = extract_stitch_params(responses[fl_sdk_i * 2])
         self._stitch_params_r = extract_stitch_params(responses[fr_sdk_i * 2])
+
+        # Optionally overlay fisheye (Kannala-Brandt) calibration so the point
+        # cloud is unprojected with the correct lens model instead of a naive
+        # pinhole. Set self._stitch_calib_path (e.g. from config) to a
+        # calibrate_fisheye.py calibration.yaml to enable; otherwise stitching
+        # falls back to the SDK pinhole intrinsics as before.
+        calib_path = getattr(self, "_stitch_calib_path", None)
+        if calib_path:
+            try:
+                calib = load_fisheye_calibration(str(calib_path))
+                attach_fisheye_calibration(self._stitch_params_l, *calib["frontleft"])
+                attach_fisheye_calibration(self._stitch_params_r, *calib["frontright"])
+                logger.info(
+                    f"Stream '{self._stream_id}': Applied fisheye calibration "
+                    f"from {calib_path}"
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                logger.warning(
+                    f"Stream '{self._stream_id}': Could not load fisheye "
+                    f"calibration ({exc}); using SDK pinhole intrinsics."
+                )
+
         logger.info(f"Stream '{self._stream_id}': Stitch params cached for front cameras")
 
     def _fill_frame_metadata_from_responses(

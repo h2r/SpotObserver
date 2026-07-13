@@ -23,6 +23,40 @@ class CamStitchParams:
     fy: float
     cx: float
     cy: float
+    # Fisheye (Kannala-Brandt) calibration. When D is set, _backproject uses the
+    # fisheye unprojection (K + D) instead of the naive pinhole formula. Left None
+    # for backward compatibility (falls back to pinhole using fx/fy/cx/cy).
+    K: np.ndarray | None = None  # (3, 3) fisheye camera matrix
+    D: np.ndarray | None = None  # (4, 1) Kannala-Brandt distortion coeffs
+
+
+def load_fisheye_calibration(path: str) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Load per-camera fisheye K + D from a calibrate_fisheye.py calibration.yaml.
+
+    Returns {"frontleft": (K, D), "frontright": (K, D)}. Attach these to the
+    CamStitchParams (see attach_fisheye_calibration) so _backproject undistorts.
+    """
+    fs = cv2.FileStorage(path, cv2.FILE_STORAGE_READ)
+    if not fs.isOpened():
+        raise FileNotFoundError(f"Cannot open calibration file: {path}")
+    out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for side in ("frontleft", "frontright"):
+        K = fs.getNode(f"K_{side}").mat()
+        D = fs.getNode(f"D_{side}").mat()
+        if K is None or D is None:
+            fs.release()
+            raise ValueError(f"calibration.yaml missing K_{side}/D_{side}: {path}")
+        out[side] = (K.astype(np.float64), D.reshape(-1, 1).astype(np.float64))
+    fs.release()
+    return out
+
+
+def attach_fisheye_calibration(
+    params: CamStitchParams, K: np.ndarray, D: np.ndarray
+) -> None:
+    """Populate a CamStitchParams' K/D in place so _backproject uses fisheye math."""
+    params.K = K
+    params.D = D
 
 
 def extract_stitch_params(response: image_pb2.ImageResponse) -> CamStitchParams:
@@ -95,14 +129,35 @@ def extract_ctb_params(response: image_pb2.ImageResponse) -> np.ndarray:
 def _backproject(
     rgb: np.ndarray, dep: np.ndarray, params: CamStitchParams
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Back-project valid pixels to body-frame 3D points."""
+    """Back-project valid pixels to body-frame 3D points.
+
+    If the camera has fisheye calibration (params.D set), each pixel is
+    unprojected with the Kannala-Brandt model (cv2.fisheye.undistortPoints) so
+    lens distortion -- strongest at the image edges -- is removed before the
+    point is placed in 3D. Otherwise it falls back to the naive pinhole
+    (u-cx)/fx*z formula, which mis-places fisheye pixels toward the periphery.
+    """
     v_idx, u_idx = np.indices(dep.shape)
     valid = (dep > 0) & np.isfinite(dep)
     z = dep[valid]
-    u = u_idx[valid].astype(np.float32)
-    v = v_idx[valid].astype(np.float32)
-    x = (u - params.cx) * z / params.fx
-    y = (v - params.cy) * z / params.fy
+    u = u_idx[valid].astype(np.float64)
+    v = v_idx[valid].astype(np.float64)
+
+    if params.D is not None:
+        K = params.K
+        if K is None:
+            K = np.array([[params.fx, 0.0, params.cx],
+                          [0.0, params.fy, params.cy],
+                          [0.0, 0.0, 1.0]], dtype=np.float64)
+        pix = np.stack((u, v), axis=-1).reshape(-1, 1, 2)
+        # undistortPoints with P=None -> normalized rays (x/z, y/z)
+        rays = cv2.fisheye.undistortPoints(pix, K, params.D).reshape(-1, 2)
+        x = rays[:, 0] * z
+        y = rays[:, 1] * z
+    else:
+        x = (u - params.cx) * z / params.fx
+        y = (v - params.cy) * z / params.fy
+
     cam_pts = np.stack((x, y, z), axis=-1)
     body_pts = cam_pts @ params.rot.T + params.trans
     return body_pts, rgb[valid]
