@@ -22,6 +22,14 @@ def _normalize(v):
     return v / torch.linalg.norm(v)
 
 
+def _as_cpu_f32(x):
+    """Accept a numpy array OR a torch tensor on any device -> cpu float32 tensor.
+    (np.asarray can't read a CUDA tensor, so route tensors through .cpu() explicitly.)"""
+    if torch.is_tensor(x):
+        return x.detach().to(device="cpu", dtype=torch.float32)
+    return torch.as_tensor(np.asarray(x), dtype=torch.float32)
+
+
 class VirtualCamera:
     def __init__(self, K, viewmat, width, height):
         self.K = K                      # (3,3) intrinsics
@@ -62,8 +70,8 @@ class VirtualCamera:
                       fov_deg=60.0, width=640, height=480, device="cpu"):
         """Auto-place: aim at the centroid of the region A and B share, backing the
         camera off along +y (the open side of the corner) far enough to frame it."""
-        a = torch.as_tensor(np.asarray(means_a), dtype=torch.float32)
-        b = torch.as_tensor(np.asarray(means_b), dtype=torch.float32)
+        a = _as_cpu_f32(means_a)
+        b = _as_cpu_f32(means_b)
         lo = torch.maximum(a.min(0).values, b.min(0).values)
         hi = torch.minimum(a.max(0).values, b.max(0).values)
         center = 0.5 * (lo + hi)
