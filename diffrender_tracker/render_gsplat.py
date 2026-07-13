@@ -19,9 +19,17 @@ match that semantics exactly we divide both the color and depth channels by alph
 Loss/health-check thresholds calibrated on the soft splatter therefore transfer directly.
 """
 
+import os
+
 import torch
 
 _rasterization = None
+
+
+def _normalize_enabled():
+    """Whether to divide color/depth by alpha (expected-value, matches soft splatter).
+    Toggle with env DIFFRENDER_GSPLAT_NORMALIZE=0 to compare against raw gsplat compositing."""
+    return os.environ.get("DIFFRENDER_GSPLAT_NORMALIZE", "1").strip().lower() not in ("0", "false", "no")
 
 
 def _get_rasterization():
@@ -82,7 +90,11 @@ def render_gsplat(gaussians, camera, transform=None, eps=1e-8,
 
     out = render_colors[0]                     # (H,W,4): RGB (accumulated) + D (accumulated)
     alpha = render_alphas[0, ..., 0]           # (H,W): accumulated coverage
-    denom = alpha.clamp_min(eps)
-    image = out[..., :3] / denom[..., None]    # -> expected color (matches soft splatter)
-    depth = out[..., 3] / denom                # -> expected depth  (matches soft splatter)
+    if _normalize_enabled():
+        denom = alpha.clamp_min(eps)
+        image = out[..., :3] / denom[..., None]   # -> expected color (matches soft splatter)
+        depth = out[..., 3] / denom               # -> expected depth  (matches soft splatter)
+    else:
+        image = out[..., :3]                      # raw gsplat compositing over black bg
+        depth = out[..., 3]
     return {"image": image, "alpha": alpha, "depth": depth}
