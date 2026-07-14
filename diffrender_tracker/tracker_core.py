@@ -51,7 +51,7 @@ def run_fit(gA, gB, T_gt, cam_full, T_init, pyramid=DEFAULT_PYRAMID, lr=0.02,
             loss.backward()
             opt.step()
             rot, tr = pose_error((T_init @ se3_exp(xi)).detach(), T_gt)
-            hist["loss"].append(float(loss)); hist["rot"].append(rot)
+            hist["loss"].append(float(loss.detach())); hist["rot"].append(rot)
             hist["trans"].append(tr); hist["cov"].append(info["coverage"])
 
     T_final = (T_init @ se3_exp(xi)).detach()
