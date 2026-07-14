@@ -18,6 +18,7 @@ rig looks along +Z (unlike the synthetic fixture's +Y). Camera placement is scen
 """
 
 import os
+import sys
 
 import numpy as np
 import torch
@@ -27,8 +28,12 @@ from se3 import se3_exp, pose_error
 from tracker_core import run_fit
 from spot_ingest import ply_to_cloud, voxel_downsample, spot_frame_rig
 
-PLY = os.path.join(os.path.dirname(__file__), "..", "PySpotObserver",
-                   "examples", "cloud_diag", "fused.ply")
+# Cloud to track: first CLI arg, else $DIFFRENDER_PLY, else the bundled cloud_diag fixture.
+# Bridge flow: capture real_cloud.ply on the Mac, then on the 4060:
+#   DIFFRENDER_DEVICE=cuda python track_real_offline.py real_cloud.ply
+_DEFAULT_PLY = os.path.join(os.path.dirname(__file__), "..", "PySpotObserver",
+                            "examples", "cloud_diag", "fused.ply")
+PLY = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("DIFFRENDER_PLY", _DEFAULT_PLY)
 DEVICE = os.environ.get("DIFFRENDER_DEVICE", "cpu")
 
 
