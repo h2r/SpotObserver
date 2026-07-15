@@ -27,6 +27,26 @@ def to_grayscale(rgb):
     return np.repeat(luma[:, None], 3, axis=1)
 
 
+def balance_intensity(col_list):
+    """Remove the per-camera luminance seam within one robot's cloud. Spot's frontleft/frontright
+    have different exposure/gain (the CCM fixes colour balance but not luminance), so a point's
+    grayscale value depends on WHICH camera saw it — which poisons the photometric loss. Normalise
+    each camera's intensity to the pooled mean/std so the same surface reads the same regardless of
+    camera. `col_list`: list of (Ni,3) grayscale arrays (one per camera). Returns the balanced list.
+
+    Caveat: this also flattens genuine content-brightness differences between the two views; it's a
+    first-order gain/bias match, good enough to kill the seam that aliases the tracker."""
+    vals = [np.asarray(c, np.float32)[:, 0] for c in col_list]
+    pooled = np.concatenate(vals)
+    mt, st = float(pooled.mean()), float(max(pooled.std(), 1e-6))
+    out = []
+    for v in vals:
+        m, s = float(v.mean()), float(max(v.std(), 1e-6))
+        vn = np.clip((v - m) / s * st + mt, 0.0, 1.0)
+        out.append(np.repeat(vn[:, None], 3, axis=1))
+    return out
+
+
 def voxel_downsample(xyz, rgb, target=20000, min_voxel=0.01):
     """Voxel-grid downsample toward ~`target` points. Picks a voxel size from the bbox volume
     and point budget; returns (xyz, rgb) float32. Uses open3d if available, else passes through."""
@@ -199,7 +219,7 @@ class SpotCloudSource:
 
     def __init__(self, config, calib, camera_mask, cameras=("frontleft", "frontright"),
                  stream_id="diffrender_ingest", stride=2, min_depth=0.2, max_depth=3.0,
-                 target=20000):
+                 target=20000, balance_lr=True):
         self.config = config
         self.calib = calib
         self.camera_mask = camera_mask
@@ -209,6 +229,7 @@ class SpotCloudSource:
         self.min_depth = min_depth
         self.max_depth = max_depth
         self.target = target
+        self.balance_lr = balance_lr        # normalise frontleft/frontright luminance at fuse
         self._conn_cm = self._conn = self._stream = self._order = None
         self.last_b2w = None
 
@@ -253,6 +274,8 @@ class SpotCloudSource:
                 col_all.append(cols)
         if not pts_all:
             return None
+        if self.balance_lr and len(col_all) > 1:
+            col_all = balance_intensity(col_all)          # kill the frontleft/right luminance seam
         xyz = np.vstack(pts_all)
         rgb = to_grayscale(np.vstack(col_all))            # collapse to intensity (grayscale)
         return voxel_downsample(xyz, rgb, target=self.target)
