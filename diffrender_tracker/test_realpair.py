@@ -25,10 +25,11 @@ import torch
 
 from gaussians import cloud_to_gaussians
 from tracker_core import run_fit
-from spot_ingest import ply_to_cloud, voxel_downsample, spot_frame_rig
+from spot_ingest import ply_to_cloud, voxel_downsample, spot_frame_rig, env_color
 from bootstrap import bootstrap_register
 
 DEVICE = os.environ.get("DIFFRENDER_DEVICE", "cpu")
+COLOR = env_color()
 
 
 def _o3d(xyz):
@@ -64,9 +65,9 @@ def main():
     if len(sys.argv) < 3:
         print("usage: python test_realpair.py robot1.ply robot2.ply"); return
     a_ply, b_ply = sys.argv[1], sys.argv[2]
-    xyz_a, rgb_a = voxel_downsample(*ply_to_cloud(a_ply, grayscale=True), target=20000)
-    xyz_b, rgb_b = voxel_downsample(*ply_to_cloud(b_ply, grayscale=True), target=20000)
-    print(f"robot1 {len(xyz_a)} pts, robot2 {len(xyz_b)} pts")
+    xyz_a, rgb_a = voxel_downsample(*ply_to_cloud(a_ply, grayscale=not COLOR), target=20000)
+    xyz_b, rgb_b = voxel_downsample(*ply_to_cloud(b_ply, grayscale=not COLOR), target=20000)
+    print(f"robot1 {len(xyz_a)} pts, robot2 {len(xyz_b)} pts  ({'rgb' if COLOR else 'grayscale'})")
 
     # honest metric: fraction of the smaller robot1 cloud explained by robot2 after alignment.
     def r1_in_r2(T):

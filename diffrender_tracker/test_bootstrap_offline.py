@@ -23,7 +23,7 @@ import torch
 from gaussians import cloud_to_gaussians
 from se3 import se3_exp, pose_error
 from tracker_core import run_fit
-from spot_ingest import ply_to_cloud, voxel_downsample, spot_frame_rig
+from spot_ingest import ply_to_cloud, voxel_downsample, spot_frame_rig, env_color
 from bootstrap import bootstrap_register
 
 _DEFAULT_PLY = os.path.join(os.path.dirname(__file__), "..", "PySpotObserver",
@@ -36,9 +36,11 @@ BASIN_DEG, BASIN_CM = 12.0, 18.0            # bootstrap must land inside this fo
 def main():
     if not os.path.exists(PLY):
         print(f"missing {PLY}"); return
-    xyz, rgb = ply_to_cloud(PLY, grayscale=True)
+    color = env_color()
+    xyz, rgb = ply_to_cloud(PLY, grayscale=not color)
     xyz, rgb = voxel_downsample(xyz, rgb, target=20000)
-    print(f"scene: {len(xyz)} pts, extent {np.round(xyz.max(0)-xyz.min(0),2)} m")
+    print(f"scene: {len(xyz)} pts ({'rgb' if color else 'grayscale'}), "
+          f"extent {np.round(xyz.max(0)-xyz.min(0),2)} m")
 
     # --- build two partially-overlapping robots with a LARGE unknown relative pose ---
     T_gt = se3_exp(torch.tensor([0.30, -0.40, 0.35, *np.deg2rad((20.0, 25.0, -30.0))],

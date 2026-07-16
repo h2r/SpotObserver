@@ -26,7 +26,7 @@ import torch
 from gaussians import cloud_to_gaussians
 from se3 import se3_exp, pose_error
 from tracker_core import run_fit
-from spot_ingest import ply_to_cloud, voxel_downsample, spot_frame_rig
+from spot_ingest import ply_to_cloud, voxel_downsample, spot_frame_rig, env_color
 
 # Cloud to track: first CLI arg, else $DIFFRENDER_PLY, else the bundled cloud_diag fixture.
 # Bridge flow: capture real_cloud.ply on the Mac, then on the 4060:
@@ -40,9 +40,10 @@ DEVICE = os.environ.get("DIFFRENDER_DEVICE", "cpu")
 def main():
     if not os.path.exists(PLY):
         print(f"missing {PLY}"); return
-    xyz, rgb = ply_to_cloud(PLY, grayscale=True)
+    color = env_color()
+    xyz, rgb = ply_to_cloud(PLY, grayscale=not color)
     xyz, rgb = voxel_downsample(xyz, rgb, target=20000)
-    print(f"real Spot cloud: {xyz.shape[0]} pts (grayscale), extent "
+    print(f"real Spot cloud: {xyz.shape[0]} pts ({'rgb' if color else 'grayscale'}), extent "
           f"{np.round(xyz.max(0)-xyz.min(0),2)} m")
 
     xyz_t = torch.as_tensor(xyz, dtype=torch.float32, device=DEVICE)

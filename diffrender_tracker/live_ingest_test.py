@@ -51,7 +51,12 @@ from common_cli import (                                    # noqa: E402  (needs
     build_config_from_args,
     parse_camera_list,
 )
-from spot_ingest import SpotCloudSource, load_fisheye_calib, spot_frame_rig   # noqa: E402
+from spot_ingest import (                                  # noqa: E402  (needs sys.path above)
+    SpotCloudSource,
+    env_color,
+    load_fisheye_calib,
+    spot_frame_rig,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,6 +71,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-depth", type=float, default=0.2)
     p.add_argument("--max-depth", type=float, default=3.0)
     p.add_argument("--target", type=int, default=20000, help="Voxel-downsample point target.")
+    p.add_argument("--color", action="store_true",
+                   help="Keep CCM-corrected RGB (default collapses to grayscale). Also honours "
+                        "env DIFFRENDER_COLOR=1.")
     p.add_argument("--save", type=str, default=None, help="Save first cloud to this .ply and exit.")
     p.add_argument("--selftest", action="store_true",
                    help="Run the gsplat tracker on one live cloud (perturb -> recover).")
@@ -131,10 +139,11 @@ def main() -> int:
     config = build_config_from_args(args)
     mask = build_camera_mask(parse_camera_list(args.cameras))
 
+    color = args.color or env_color()
     with SpotCloudSource(config, calib, mask, cameras=parse_camera_list_names(args.cameras),
                          stride=args.stride, min_depth=args.min_depth,
-                         max_depth=args.max_depth, target=args.target) as src:
-        print("streaming; order =", src._order)
+                         max_depth=args.max_depth, target=args.target, color=color) as src:
+        print(f"streaming; order = {src._order}  color = {color}")
 
         if args.save or args.selftest:
             cloud = None
@@ -145,8 +154,10 @@ def main() -> int:
             if cloud is None or len(cloud[0]) <= 500:
                 print("no usable cloud received."); return 1
             xyz, rgb = cloud
+            chan = "rgb" if color else "gray"
             print(f"cloud: {len(xyz)} pts, extent {np.round(xyz.max(0)-xyz.min(0),2)} m, "
-                  f"gray range [{rgb.min():.2f},{rgb.max():.2f}]")
+                  f"{chan} range [{rgb.min():.2f},{rgb.max():.2f}]  "
+                  f"chroma spread {float(rgb.max(1).mean()-rgb.min(1).mean()):.3f}")
             if args.save:
                 save_ply(args.save, xyz, rgb)
             if args.selftest:

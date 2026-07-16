@@ -8,15 +8,31 @@ The tracker consumes clouds as (xyz Nx3 float32 [m], rgb Nx3 float32 [0,1]) — 
   * a live SpotCloudSource (streaming) — added next; it reuses the same backprojection the
     PySpotObserver examples use, then feeds clouds through `voxel_downsample` + `to_grayscale`.
 
-Spot's front cameras are grayscale, so color = intensity (per the grayscale decision). Real
-clouds are ~40k points room-scale, so `voxel_downsample` trims to the tracker's ~20k budget.
+COLOR vs GRAYSCALE: these robots' front fisheye cameras are actually COLOR (camera_stream.py
+requests PIXEL_FORMAT_RGB_U8 and applies a per-camera CCM — see pyspotobserver/color_correction).
+The tracker historically collapsed that to grayscale, but grayscale indoor texture is self-similar
+and aliases the photometric loss (the low-coverage tracker divergence). The ingest now keeps color
+when asked: pass `color=True` / `grayscale=False`, or set env `DIFFRENDER_COLOR=1`. Default stays
+grayscale so existing captures/tests are unchanged. Real clouds are ~40k points room-scale, so
+`voxel_downsample` trims to the tracker's ~20k budget.
 """
+
+import os
 
 import numpy as np
 
 # Drop rays past this incidence angle; the Kannala-Brandt unprojection blows up at the rim
 # (same constant as examples/live_pointcloud.py).
 _MAX_ANGLE_DEG = 85.0
+
+
+def env_color(default=False):
+    """Shared switch so the offline test scripts + capture agree on color vs grayscale.
+    True iff env DIFFRENDER_COLOR is set truthy. Keeps color the OPT-IN (default grayscale)."""
+    v = os.environ.get("DIFFRENDER_COLOR")
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "rgb", "color")
 
 
 def to_grayscale(rgb):
@@ -30,20 +46,23 @@ def to_grayscale(rgb):
 def balance_intensity(col_list):
     """Remove the per-camera luminance seam within one robot's cloud. Spot's frontleft/frontright
     have different exposure/gain (the CCM fixes colour balance but not luminance), so a point's
-    grayscale value depends on WHICH camera saw it — which poisons the photometric loss. Normalise
-    each camera's intensity to the pooled mean/std so the same surface reads the same regardless of
-    camera. `col_list`: list of (Ni,3) grayscale arrays (one per camera). Returns the balanced list.
+    value depends on WHICH camera saw it — which poisons the photometric loss. Normalise each
+    camera to the pooled mean/std, PER CHANNEL, so the same surface reads the same regardless of
+    camera. `col_list`: list of (Ni,3) color arrays (one per camera). Returns the balanced list.
 
+    Per-channel so it works for both grayscale (all channels equal -> same as luma match) and RGB
+    (each channel balanced independently, correcting a colour-cast seam, not just brightness).
     Caveat: this also flattens genuine content-brightness differences between the two views; it's a
     first-order gain/bias match, good enough to kill the seam that aliases the tracker."""
-    vals = [np.asarray(c, np.float32)[:, 0] for c in col_list]
-    pooled = np.concatenate(vals)
-    mt, st = float(pooled.mean()), float(max(pooled.std(), 1e-6))
+    arrs = [np.asarray(c, np.float32).reshape(-1, 3) for c in col_list]
+    pooled = np.concatenate(arrs, axis=0)
+    mt = pooled.mean(axis=0)                                   # (3,) per-channel target mean
+    st = np.maximum(pooled.std(axis=0), 1e-6)                  # (3,) per-channel target std
     out = []
-    for v in vals:
-        m, s = float(v.mean()), float(max(v.std(), 1e-6))
-        vn = np.clip((v - m) / s * st + mt, 0.0, 1.0)
-        out.append(np.repeat(vn[:, None], 3, axis=1))
+    for a in arrs:
+        m = a.mean(axis=0)
+        s = np.maximum(a.std(axis=0), 1e-6)
+        out.append(np.clip((a - m) / s * st + mt, 0.0, 1.0))
     return out
 
 
@@ -138,8 +157,10 @@ def load_fisheye_calib(path_arg):
     return out
 
 
-def _to_gray_rgb_img(rgb):
-    """(H,W)|(H,W,1)|(H,W,3) image -> (H,W,3) float [0,1]. Spot front cams are grayscale."""
+def _to_float_rgb_img(rgb):
+    """(H,W)|(H,W,1)|(H,W,3) image -> (H,W,3) float [0,1]. PRESERVES color for a 3-channel
+    (CCM-corrected RGB) image; replicates a single channel to 3 for a grayscale source. The
+    grayscale collapse (if any) happens later in `latest()`/`ply_to_cloud`, not here."""
     arr = np.asarray(rgb)
     if arr.dtype == np.uint8:
         arr = arr.astype(np.float32) / 255.0
@@ -206,20 +227,22 @@ def spot_frame_rig(xyz_a, xyz_b, azimuths=(-40.0, 0.0, 40.0), margin=1.4,
 
 class SpotCloudSource:
     """Live colored-cloud source for ONE robot: streams frontleft+frontright, fisheye-backprojects
-    depth+intensity, fuses both into the frontleft frame, converts to grayscale, and voxel-
-    downsamples to ~target points. Drop-to-latest (get_current_images returns the newest frame).
+    depth+color, fuses both into the frontleft frame, (optionally) collapses to grayscale, and
+    voxel-downsamples to ~target points. Drop-to-latest (get_current_images returns the newest frame).
 
     Use as a context manager:
-        with SpotCloudSource(config, calib, camera_mask) as src:
-            xyz, rgb = src.latest()        # (N,3) f32 metres, (N,3) f32 grayscale [0,1]
+        with SpotCloudSource(config, calib, camera_mask, color=True) as src:
+            xyz, rgb = src.latest()        # (N,3) f32 metres, (N,3) f32 [0,1] (RGB if color=True)
 
+    `color=False` (default) collapses to grayscale, matching the historical behaviour; `color=True`
+    keeps the CCM-corrected RGB (richer texture -> less aliasing for the photometric tracker).
     `config` is a SpotConfig (build it with common_cli.build_config_from_args), `calib` from
     load_fisheye_calib, `camera_mask` from common_cli.build_camera_mask. pyspotobserver is
     imported lazily so this module stays importable on a box without the SDK."""
 
     def __init__(self, config, calib, camera_mask, cameras=("frontleft", "frontright"),
                  stream_id="diffrender_ingest", stride=2, min_depth=0.2, max_depth=3.0,
-                 target=20000, balance_lr=True):
+                 target=20000, balance_lr=True, color=False):
         self.config = config
         self.calib = calib
         self.camera_mask = camera_mask
@@ -230,6 +253,7 @@ class SpotCloudSource:
         self.max_depth = max_depth
         self.target = target
         self.balance_lr = balance_lr        # normalise frontleft/frontright luminance at fuse
+        self.color = color                  # keep RGB (True) or collapse to grayscale (False)
         self._conn_cm = self._conn = self._stream = self._order = None
         self.last_b2w = None
 
@@ -251,8 +275,9 @@ class SpotCloudSource:
                 self._conn_cm.__exit__(*exc)
 
     def latest(self, timeout=2.0):
-        """Newest frame -> (xyz Nx3 f32, gray_rgb Nx3 f32) in the frontleft frame, or None if
-        no valid points this frame. Stores body_to_world in self.last_b2w."""
+        """Newest frame -> (xyz Nx3 f32, rgb Nx3 f32 [0,1]) in the frontleft frame, or None if
+        no valid points this frame. RGB when color=True, else grayscale (channels equal). Stores
+        body_to_world in self.last_b2w."""
         rgb_list, depth_list, b2w = self._stream.get_current_images(
             timeout=timeout, run_pipeline=False, copy=True)
         self.last_b2w = b2w
@@ -263,7 +288,7 @@ class SpotCloudSource:
             if nm not in imgs:
                 continue
             rgb, dep = imgs[nm]
-            color = _to_gray_rgb_img(rgb)
+            color = _to_float_rgb_img(rgb)                # preserves CCM-corrected RGB
             pts, cols = backproject_fisheye(dep, color, self.calib[f"K_{nm}"],
                                             self.calib[f"D_{nm}"], self.stride,
                                             self.min_depth, self.max_depth)
@@ -275,9 +300,11 @@ class SpotCloudSource:
         if not pts_all:
             return None
         if self.balance_lr and len(col_all) > 1:
-            col_all = balance_intensity(col_all)          # kill the frontleft/right luminance seam
+            col_all = balance_intensity(col_all)          # kill the frontleft/right seam (per-channel)
         xyz = np.vstack(pts_all)
-        rgb = to_grayscale(np.vstack(col_all))            # collapse to intensity (grayscale)
+        rgb = np.vstack(col_all)
+        if not self.color:
+            rgb = to_grayscale(rgb)                       # collapse to intensity unless color=True
         return voxel_downsample(xyz, rgb, target=self.target)
 
 
