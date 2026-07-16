@@ -43,8 +43,11 @@ def cloud_to_gaussians(xyz, rgb, scale=None, scale_mult=1.0, opacity=0.99,
         colors    (N,3) float
         spacing   float        -- estimated point spacing (m), for reference
     """
-    means = torch.as_tensor(np.asarray(xyz), device=device, dtype=dtype)
-    colors = torch.as_tensor(np.asarray(rgb), device=device, dtype=dtype).clamp(0, 1)
+    # accept numpy/list OR a torch tensor on ANY device (np.asarray can't read a CUDA tensor)
+    means = torch.as_tensor(xyz if torch.is_tensor(xyz) else np.asarray(xyz),
+                            device=device, dtype=dtype)
+    colors = torch.as_tensor(rgb if torch.is_tensor(rgb) else np.asarray(rgb),
+                             device=device, dtype=dtype).clamp(0, 1)
     n = means.shape[0]
 
     spacing = estimate_spacing(means)
