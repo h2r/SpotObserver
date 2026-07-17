@@ -51,6 +51,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--duration", type=float, default=600.0, help="Max seconds to run.")
     parser.add_argument("--timeout", type=float, default=2.0, help="Per-frame fetch timeout (s).")
     parser.add_argument("--tile-width", type=int, default=480, help="Width of each camera tile.")
+    parser.add_argument(
+        "--layout",
+        choices=["row", "grid"],
+        default="row",
+        help="'row': single side-by-side strip [TUSKER L|R | GOUGER L|R]. "
+        "'grid': one robot per row (2x2).",
+    )
     return parser.parse_args()
 
 
@@ -134,7 +141,9 @@ def main() -> int:
                     ]
                     rows.append(np.hstack(row_tiles))
 
-                cv2.imshow(WINDOW, np.vstack(rows))
+                # 'row': one side-by-side strip; 'grid': one robot per row.
+                canvas = np.hstack(rows) if args.layout == "row" else np.vstack(rows)
+                cv2.imshow(WINDOW, canvas)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     logger.info("User requested quit")
                     break
