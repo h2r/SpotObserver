@@ -80,9 +80,10 @@ def main():
     # --- 1. BOOTSTRAP (no prior) ---
     T_boot, info = bootstrap_register(xyz_a, rgb_a, xyz_b, rgb_b, voxel=0.05)
     s_boot, b_boot = r1_in_r2(T_boot)
-    print("\n1. BOOTSTRAP (FPFH + best-of-N RANSAC + colored ICP)")
+    print("\n1. BOOTSTRAP (FPFH + best-of-N RANSAC + multiscale colored ICP + identity guard)")
     print(f"   ransac fit {info['ransac_fitness']:.2f}  icp fit {info['icp_fitness']:.2f}  "
-          f"rmse {info['icp_rmse']*100:.1f} cm")
+          f"rmse {info['icp_rmse']*100:.1f} cm  -> chose {info.get('chosen','icp')}"
+          + ("  (guard fired: refine was worse than identity)" if info.get('chosen') == 'identity' else ""))
     print(f"   robot1->robot2 overlap: {s_boot*100:.0f}%")
 
     # --- 2. TRACK (photometric refine from the bootstrap seed) ---
