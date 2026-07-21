@@ -932,16 +932,6 @@ class SpotCamStream:
                 responses[0].shot.acquisition_time.seconds
                 + responses[0].shot.acquisition_time.nanos / 1e9
             )
-            # TEMP DIAGNOSTIC: does the robot report per-camera exposure/gain? If these
-            # print non-zero, we can exposure-match cameras from metadata instead of pixels.
-            if not getattr(self, "_logged_capture_params", False):
-                for i, cam in enumerate(self._sdk_camera_order):
-                    cp = responses[i * 2].shot.capture_params
-                    exp_ms = (cp.exposure_duration.seconds + cp.exposure_duration.nanos / 1e9) * 1e3
-                    logger.info(
-                        f"capture_params {cam.name}: exposure={exp_ms:.3f}ms gain={cp.gain:.4f}"
-                    )
-                self._logged_capture_params = True
             try:
                 body_to_worlds: list[np.ndarray] = []
                 for i in range(len(self._sdk_camera_order)):

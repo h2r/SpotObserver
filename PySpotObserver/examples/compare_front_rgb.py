@@ -10,13 +10,13 @@ longer shows a brightness step at the seam.
     [ GOUGER  stitched front ]
 
 Use --view lr to instead see the left/right tiles, each rotated 90° clockwise (the
-front cameras are mounted sideways) and exposure-matched to each other, one row per
-robot with right-then-left:
+front cameras are mounted sideways), one row per robot with right-then-left:
 
     [ TUSKER R ][ TUSKER L ]
     [ GOUGER R ][ GOUGER L ]
 
-RGB only (no depth). Press 'q' to quit.
+RGB only (no depth). Press 'q' to quit, or 'c' to toggle the per-camera color
+calibration (CCM) off/on live so you can compare calibrated vs raw output.
 
 Example:
     python examples/compare_front_rgb.py \
@@ -36,7 +36,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from pyspotobserver import CameraType, SpotConfig, SpotConnection
-from pyspotobserver.stitch import STITCH_OUT_H, STITCH_OUT_W, _GAIN_LIMITS, _LUMA_WEIGHTS
+from pyspotobserver.stitch import STITCH_OUT_H, STITCH_OUT_W
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -66,9 +66,15 @@ def parse_args() -> argparse.Namespace:
         choices=["stitch", "lr"],
         default="stitch",
         help="'stitch': fused front panorama per robot (default). "
-        "'lr': raw left/right tiles side by side.",
+        "'lr': left/right tiles rotated 90° CW, one row per robot (right then left).",
     )
     parser.add_argument("--tile-width", type=int, default=None, help="Width per panel (px).")
+    parser.add_argument(
+        "--no-color-correct",
+        action="store_true",
+        help="Start with the per-camera color calibration (CCM) OFF so you see raw "
+        "camera output. Press 'c' at any time to toggle calibrated vs raw live.",
+    )
     parser.add_argument(
         "--calib",
         help="Override fisheye calibration.yaml path (applies to all robots). "
@@ -96,30 +102,6 @@ def to_bgr_uint8(rgb: np.ndarray) -> np.ndarray:
     """Corrected RGB float [0,1] (H,W,3) -> displayable BGR uint8."""
     img = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
     return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-
-
-def match_exposure(
-    bgr_l: np.ndarray | None, bgr_r: np.ndarray | None
-) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """Scale the darker of the two BGR uint8 tiles up to the brighter by mean
-    luminance, so the independently auto-exposed front cameras look consistent side
-    by side. Same idea as stitch._match_gain, but measured over the whole frame since
-    the raw tiles share no overlapping FOV. No-op if either side is missing or black.
-    """
-    if bgr_l is None or bgr_r is None:
-        return bgr_l, bgr_r
-    w = _LUMA_WEIGHTS[::-1]  # _LUMA_WEIGHTS is RGB order; these tiles are BGR
-    lum_l = float((bgr_l.astype(np.float32) * w).sum(axis=2).mean())
-    lum_r = float((bgr_r.astype(np.float32) * w).sum(axis=2).mean())
-    if lum_l <= 1e-4 or lum_r <= 1e-4:
-        return bgr_l, bgr_r
-    if lum_l < lum_r:
-        gain = float(np.clip(lum_r / lum_l, *_GAIN_LIMITS))
-        bgr_l = np.clip(bgr_l.astype(np.float32) * gain, 0, 255).astype(np.uint8)
-    else:
-        gain = float(np.clip(lum_l / lum_r, *_GAIN_LIMITS))
-        bgr_r = np.clip(bgr_r.astype(np.float32) * gain, 0, 255).astype(np.uint8)
-    return bgr_l, bgr_r
 
 
 def make_tile(img_bgr: np.ndarray | None, label: str, tile_w: int, tile_h: int) -> np.ndarray:
@@ -169,12 +151,9 @@ def render_lr(streams, args, tile_w: int) -> np.ndarray:
     rows = []
     for name, stream in streams:
         frames = fetch_rgb(stream, args.timeout)
-        # Balance the two independently auto-exposed cameras before tiling.
-        left, right = match_exposure(
-            frames.get(CameraType.FRONTLEFT), frames.get(CameraType.FRONTRIGHT)
-        )
         robot_tiles = []
-        for cam, img in ((CameraType.FRONTRIGHT, right), (CameraType.FRONTLEFT, left)):
+        for cam in (CameraType.FRONTRIGHT, CameraType.FRONTLEFT):
+            img = frames.get(cam)
             if img is not None:
                 img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
             robot_tiles.append(make_tile(img, f"{name} {cam.name}", tile_w, tile_h))
@@ -223,13 +202,28 @@ def main() -> int:
             logger.info("Streaming front cameras from %s (%s)", robot_name(ip), ip)
 
         render = render_stitch if stitch_view else render_lr
+
+        # Live A/B of the per-camera color calibration. We stash each stream's CCMs so
+        # 'c' can toggle them off (raw) and back on (calibrated) on the same live scene.
+        orig_ccms = {id(stream): stream._ccms for _name, stream in streams}  # noqa: SLF001
+        color_on = not args.no_color_correct
+        for _name, stream in streams:
+            stream._ccms = orig_ccms[id(stream)] if color_on else None  # noqa: SLF001
+        logger.info("Color calibration %s (press 'c' to toggle)", "ON" if color_on else "OFF (raw)")
+
         try:
             start = time.perf_counter()
             while time.perf_counter() - start < args.duration:
                 cv2.imshow(WINDOW, render(streams, args, tile_w))
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
                     logger.info("User requested quit")
                     break
+                if key == ord("c"):
+                    color_on = not color_on
+                    for _name, stream in streams:
+                        stream._ccms = orig_ccms[id(stream)] if color_on else None  # noqa: SLF001
+                    logger.info("Color calibration %s", "ON" if color_on else "OFF (raw)")
         finally:
             for _name, stream in streams:
                 stream.stop_streaming()
