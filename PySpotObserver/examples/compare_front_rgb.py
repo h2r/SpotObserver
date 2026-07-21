@@ -15,8 +15,9 @@ front cameras are mounted sideways), one row per robot with right-then-left:
     [ TUSKER R ][ TUSKER L ]
     [ GOUGER R ][ GOUGER L ]
 
-RGB only (no depth). Press 'q' to quit, or 'c' to toggle the per-camera color
-calibration (CCM) off/on live so you can compare calibrated vs raw output.
+RGB only (no depth). Keys: 'q' quit; 'c' toggle per-camera color calibration (CCM)
+off/on (calibrated vs raw); 'm' toggle the live match of the right front camera to the
+left (color + brightness), which cleans up the residual pink/exposure a fixed CCM can't.
 
 Example:
     python examples/compare_front_rgb.py \
@@ -76,6 +77,13 @@ def parse_args() -> argparse.Namespace:
         "camera output. Press 'c' at any time to toggle calibrated vs raw live.",
     )
     parser.add_argument(
+        "--no-match-lr",
+        dest="match_lr",
+        action="store_false",
+        help="Disable the live per-frame match of the right front camera to the left "
+        "(color + brightness). On by default in the 'lr' view; toggle live with 'm'.",
+    )
+    parser.add_argument(
         "--calib",
         help="Override fisheye calibration.yaml path (applies to all robots). "
         "By default each known robot uses examples/calib/<spot|spot2>/calibration.yaml.",
@@ -102,6 +110,24 @@ def to_bgr_uint8(rgb: np.ndarray) -> np.ndarray:
     """Corrected RGB float [0,1] (H,W,3) -> displayable BGR uint8."""
     img = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
     return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+
+def match_right_to_left(
+    left_bgr: np.ndarray | None, right_bgr: np.ndarray | None
+) -> np.ndarray | None:
+    """Scale the right front camera's per-channel means to the left's, so right matches
+    the (well-calibrated) left in BOTH color and brightness. This fixes the residual
+    per-camera cast (front-right's pink) and the live exposure difference that a fixed
+    CCM can't track — the two front cameras are different sensors and auto-expose
+    independently, so no static matrix makes them agree. Gray-world assumption: the two
+    overlapping (~62°) front cams see roughly similar average color; approximate if they
+    happen to view very different scenes. Left is left untouched (it's the anchor)."""
+    if left_bgr is None or right_bgr is None:
+        return right_bgr
+    lmean = left_bgr.reshape(-1, 3).mean(axis=0)
+    rmean = right_bgr.reshape(-1, 3).mean(axis=0)
+    gains = np.clip(lmean / np.clip(rmean, 1e-3, None), 0.3, 3.0)
+    return np.clip(right_bgr.astype(np.float32) * gains, 0, 255).astype(np.uint8)
 
 
 def make_tile(img_bgr: np.ndarray | None, label: str, tile_w: int, tile_h: int) -> np.ndarray:
@@ -151,9 +177,12 @@ def render_lr(streams, args, tile_w: int) -> np.ndarray:
     rows = []
     for name, stream in streams:
         frames = fetch_rgb(stream, args.timeout)
+        left = frames.get(CameraType.FRONTLEFT)
+        right = frames.get(CameraType.FRONTRIGHT)
+        if getattr(args, "match_lr", False):
+            right = match_right_to_left(left, right)
         robot_tiles = []
-        for cam in (CameraType.FRONTRIGHT, CameraType.FRONTLEFT):
-            img = frames.get(cam)
+        for cam, img in ((CameraType.FRONTRIGHT, right), (CameraType.FRONTLEFT, left)):
             if img is not None:
                 img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
             robot_tiles.append(make_tile(img, f"{name} {cam.name}", tile_w, tile_h))
@@ -224,6 +253,9 @@ def main() -> int:
                     for _name, stream in streams:
                         stream._ccms = orig_ccms[id(stream)] if color_on else None  # noqa: SLF001
                     logger.info("Color calibration %s", "ON" if color_on else "OFF (raw)")
+                if key == ord("m"):
+                    args.match_lr = not args.match_lr
+                    logger.info("Live right->left match %s", "ON" if args.match_lr else "OFF")
         finally:
             for _name, stream in streams:
                 stream.stop_streaming()
