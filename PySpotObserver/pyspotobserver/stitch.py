@@ -14,6 +14,83 @@ from bosdyn.client.frame_helpers import (  # type: ignore[import-untyped]
 STITCH_OUT_W = 1800
 STITCH_OUT_H = 1000
 
+# Exposure/gain compensation. The two front cameras auto-expose independently and
+# point ~62 deg apart, so one (typically frontleft) comes out darker. Their static
+# color-correction matrices bake in fixed per-camera gains and cannot track this, so
+# the raw stitch shows a brightness step at the seam. We measure mean luminance over
+# the overlapping FOV and scale the darker side up to the brighter one before blending.
+_LUMA_WEIGHTS = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)  # RGB (Rec.709)
+_MIN_OVERLAP_PX = 200  # too little overlap -> gain estimate is noise; skip
+_GAIN_LIMITS = (0.4, 4.0)  # clamp so a bad estimate can't blow out the image
+
+
+def _mean_luma(rgb_pixels: np.ndarray) -> float:
+    """Mean Rec.709 luminance of an (N, 3) or (H, W, 3) RGB float array."""
+    if rgb_pixels.size == 0:
+        return 0.0
+    return float((rgb_pixels.reshape(-1, 3) * _LUMA_WEIGHTS).sum(axis=1).mean())
+
+
+def _match_gain(
+    rgb_l: np.ndarray,
+    cov_l: np.ndarray,
+    rgb_r: np.ndarray,
+    cov_r: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Scale the darker of the two images up to the brighter, measured over the
+    overlap (cov_l & cov_r). Returns the (possibly rescaled) images; the whole
+    darker image is scaled so brightness is consistent across the panorama, not
+    just in the seam. No-op when the overlap is too small or either side is black.
+    """
+    overlap = cov_l & cov_r
+    if int(overlap.sum()) < _MIN_OVERLAP_PX:
+        return rgb_l, rgb_r
+    lum_l = _mean_luma(rgb_l[overlap])
+    lum_r = _mean_luma(rgb_r[overlap])
+    if lum_l <= 1e-4 or lum_r <= 1e-4:
+        return rgb_l, rgb_r
+    if lum_l < lum_r:
+        gain = float(np.clip(lum_r / lum_l, *_GAIN_LIMITS))
+        rgb_l = np.clip(rgb_l * gain, 0.0, 1.0)
+    else:
+        gain = float(np.clip(lum_l / lum_r, *_GAIN_LIMITS))
+        rgb_r = np.clip(rgb_r * gain, 0.0, 1.0)
+    return rgb_l, rgb_r
+
+
+def _rasterize_frontal(
+    pts: np.ndarray,
+    cols: np.ndarray,
+    out_w: int,
+    out_h: int,
+    f_virt: float,
+    cx_v: float,
+    cy_v: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Project one camera's body-frame points onto the virtual frontal canvas.
+
+    Returns (rgb, dep) canvases; nearer points win (painted far-to-near). Keeping
+    each camera on its own canvas lets us gain-match them before compositing.
+    """
+    rgb = np.zeros((out_h, out_w, 3), dtype=np.float32)
+    dep = np.zeros((out_h, out_w), dtype=np.float32)
+
+    fwd = pts[:, 0]
+    keep = fwd > 0.1
+    pts, cols, fwd = pts[keep], cols[keep], fwd[keep]
+    if pts.shape[0] == 0:
+        return rgb, dep
+
+    u = (-pts[:, 1] * f_virt / pts[:, 0] + cx_v).astype(np.int32)
+    v = (-pts[:, 2] * f_virt / pts[:, 0] + cy_v).astype(np.int32)
+    in_bounds = (u >= 0) & (u < out_w) & (v >= 0) & (v < out_h)
+    u, v, cols, fwd = u[in_bounds], v[in_bounds], cols[in_bounds], fwd[in_bounds]
+
+    order = np.argsort(fwd)[::-1]  # far-to-near so closer points overwrite
+    rgb[v[order], u[order]] = cols[order]
+    dep[v[order], u[order]] = fwd[order]
+    return rgb, dep
+
 
 @dataclass
 class CamStitchParams:
@@ -172,8 +249,13 @@ def _stitch_pointcloud(
     r_params: CamStitchParams,
     out_rgb: np.ndarray,
     out_dep: np.ndarray,
+    match_exposure: bool = True,
 ) -> None:
-    """Depth-based stitcher: back-projects pixels to body-frame point cloud, then re-projects."""
+    """Depth-based stitcher: back-projects pixels to a body-frame point cloud, then
+    re-projects. Each camera is rasterized onto its own canvas so their brightness can
+    be gain-matched over the overlap before compositing; in the overlap the nearer
+    point wins (same as the original single-canvas far-to-near paint).
+    """
     out_h, out_w = out_rgb.shape[:2]
     out_rgb[:] = 0.0
     out_dep[:] = 0.0
@@ -181,36 +263,36 @@ def _stitch_pointcloud(
     pts_l, cols_l = _backproject(l_rgb, l_dep, l_params)
     pts_r, cols_r = _backproject(r_rgb, r_dep, r_params)
 
-    pts = np.vstack((pts_l, pts_r))
-    cols = np.vstack((cols_l, cols_r))
-
-    # Keep only points in front of robot (body X = forward)
-    fwd = pts[:, 0]
-    keep = fwd > 0.1
-    pts, cols, fwd = pts[keep], cols[keep], fwd[keep]
-
     # Virtual frontal projection: u = -Y/X * f + cx_v,  v = -Z/X * f + cy_v
     # cy_v is anchored to the camera's own principal point so the horizon stays
     # at the same canvas row regardless of how tall the output buffer is.
     f_virt = l_params.fx
     cx_v, cy_v = out_w / 2.0, l_params.cy
-    u = (-pts[:, 1] * f_virt / pts[:, 0] + cx_v).astype(np.int32)
-    v = (-pts[:, 2] * f_virt / pts[:, 0] + cy_v).astype(np.int32)
 
-    in_bounds = (u >= 0) & (u < out_w) & (v >= 0) & (v < out_h)
-    u, v, cols, fwd = u[in_bounds], v[in_bounds], cols[in_bounds], fwd[in_bounds]
+    rgb_l, dep_l = _rasterize_frontal(pts_l, cols_l, out_w, out_h, f_virt, cx_v, cy_v)
+    rgb_r, dep_r = _rasterize_frontal(pts_r, cols_r, out_w, out_h, f_virt, cx_v, cy_v)
 
-    # Paint far-to-near so closer points win
-    order = np.argsort(fwd)[::-1]
-    out_rgb[v[order], u[order]] = cols[order]
-    out_dep[v[order], u[order]] = fwd[order]
+    cov_l = dep_l > 0
+    cov_r = dep_r > 0
+    if match_exposure:
+        rgb_l, rgb_r = _match_gain(rgb_l, cov_l, rgb_r, cov_r)
 
-    # Fill single-pixel gaps via dilation
-    # kernel = np.ones((3, 3), np.uint8)
-    # rgb_u8 = (np.clip(out_rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
-    # out_rgb[:] = cv2.dilate(rgb_u8, kernel, iterations=1).astype(np.float32) / 255.0
-    # dep_dilated = cv2.dilate(out_dep, kernel, iterations=1)
-    # out_dep[:] = np.where(out_dep > 0, out_dep, dep_dilated)
+    # Composite: exclusive coverage copies straight over; in the overlap the nearer
+    # (smaller depth) point wins, matching the original far-to-near semantics.
+    only_l = cov_l & ~cov_r
+    only_r = cov_r & ~cov_l
+    both = cov_l & cov_r
+    l_near = both & (dep_l <= dep_r)
+    r_near = both & ~l_near
+
+    for mask, rgb_src, dep_src in (
+        (only_l, rgb_l, dep_l),
+        (only_r, rgb_r, dep_r),
+        (l_near, rgb_l, dep_l),
+        (r_near, rgb_r, dep_r),
+    ):
+        out_rgb[mask] = rgb_src[mask]
+        out_dep[mask] = dep_src[mask]
 
 
 def _stitch_cylindrical(
@@ -222,6 +304,7 @@ def _stitch_cylindrical(
     r_params: CamStitchParams,
     out_rgb: np.ndarray,
     out_dep: np.ndarray,
+    match_exposure: bool = True,
 ) -> None:
     """
     Depth-free stitcher: for each virtual canvas pixel, back-computes the body-frame
@@ -276,6 +359,9 @@ def _stitch_cylindrical(
         r_rgb, map_xr, map_yr, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0
     )
 
+    if match_exposure:
+        warped_l, warped_r = _match_gain(warped_l, valid_l, warped_r, valid_r)
+
     out_rgb[:] = 0.0
     out_rgb[valid_l & ~valid_r] = warped_l[valid_l & ~valid_r]
     out_rgb[valid_r & ~valid_l] = warped_r[valid_r & ~valid_l]
@@ -309,6 +395,7 @@ def compute_stitch(
     out_rgb: np.ndarray,
     out_dep: np.ndarray,
     use_depth: bool = True,
+    match_exposure: bool = True,
 ) -> None:
     """
     Stitch left and right front camera images onto a virtual forward-facing canvas.
@@ -316,11 +403,17 @@ def compute_stitch(
     use_depth=True  — point-cloud projection (accurate at all ranges, requires depth).
     use_depth=False — direction-only inverse warp (no depth needed, parallax error
                       grows as objects get closer than ~3 m).
+    match_exposure  — when True (default), scale the darker camera up to the brighter
+                      over their overlap so the seam is not a brightness step.
 
     Results written in-place to out_rgb (H, W, 3) float32 and out_dep (H, W) float32.
     out_dep is zeroed when use_depth=False.
     """
     if use_depth:
-        _stitch_pointcloud(l_rgb, l_dep, l_params, r_rgb, r_dep, r_params, out_rgb, out_dep)
+        _stitch_pointcloud(
+            l_rgb, l_dep, l_params, r_rgb, r_dep, r_params, out_rgb, out_dep, match_exposure
+        )
     else:
-        _stitch_cylindrical(l_rgb, l_dep, l_params, r_rgb, r_dep, r_params, out_rgb, out_dep)
+        _stitch_cylindrical(
+            l_rgb, l_dep, l_params, r_rgb, r_dep, r_params, out_rgb, out_dep, match_exposure
+        )

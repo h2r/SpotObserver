@@ -1,14 +1,21 @@
 """
-Live side-by-side comparison of the color/light-corrected front RGB feeds.
+Live comparison of the front cameras, color/light-corrected.
 
-Streams FRONTLEFT + FRONTRIGHT from one or two Spots and tiles the corrected
-RGB images into a single window for easy comparison:
+Default view is the STITCHED front panorama (frontleft + frontright fused so the
+floor connects), one per robot, stacked for comparison. The stitch gain-matches
+the two cameras over their overlap so the darker side (usually frontleft) no
+longer shows a brightness step at the seam.
 
-    [ robotA FRONTLEFT ][ robotA FRONTRIGHT ]
-    [ robotB FRONTLEFT ][ robotB FRONTRIGHT ]
+    [ TUSKER  stitched front ]
+    [ GOUGER  stitched front ]
 
-RGB only (no depth). Color correction + sRGB light correction are applied
-inside the stream automatically for known robot IPs. Press 'q' to quit.
+Use --view lr to instead see the raw tiles, each rotated 90° clockwise (the front
+cameras are mounted sideways), one row per robot with right-then-left:
+
+    [ TUSKER R ][ TUSKER L ]
+    [ GOUGER R ][ GOUGER L ]
+
+RGB only (no depth). Press 'q' to quit.
 
 Example:
     python examples/compare_front_rgb.py \
@@ -23,10 +30,12 @@ import argparse
 import logging
 import time
 from contextlib import ExitStack
+from pathlib import Path
 
 import cv2
 import numpy as np
 from pyspotobserver import CameraType, SpotConfig, SpotConnection
+from pyspotobserver.stitch import STITCH_OUT_H, STITCH_OUT_W
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -34,11 +43,12 @@ logger = logging.getLogger(__name__)
 WINDOW = "Front RGB comparison (q to quit)"
 FRONT_CAMERAS = [CameraType.FRONTLEFT, CameraType.FRONTRIGHT]
 BANNER_H = 28
+_CALIB_ROOT = Path(__file__).with_name("calib")
 
-# Friendly names for known robots; falls back to the IP otherwise.
-ROBOT_NAMES = {
-    "128.148.138.22": "TUSKER",
-    "128.148.138.21": "GOUGER",
+# Friendly names + fisheye calibration folder for known robots.
+ROBOT_INFO = {
+    "128.148.138.22": ("TUSKER", "spot"),
+    "128.148.138.21": ("GOUGER", "spot2"),
 }
 
 
@@ -50,19 +60,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--password", required=True)
     parser.add_argument("--duration", type=float, default=600.0, help="Max seconds to run.")
     parser.add_argument("--timeout", type=float, default=2.0, help="Per-frame fetch timeout (s).")
-    parser.add_argument("--tile-width", type=int, default=480, help="Width of each camera tile.")
     parser.add_argument(
-        "--layout",
-        choices=["row", "grid"],
-        default="row",
-        help="'row': single side-by-side strip [TUSKER L|R | GOUGER L|R]. "
-        "'grid': one robot per row (2x2).",
+        "--view",
+        choices=["stitch", "lr"],
+        default="stitch",
+        help="'stitch': fused front panorama per robot (default). "
+        "'lr': raw left/right tiles side by side.",
+    )
+    parser.add_argument("--tile-width", type=int, default=None, help="Width per panel (px).")
+    parser.add_argument(
+        "--calib",
+        help="Override fisheye calibration.yaml path (applies to all robots). "
+        "By default each known robot uses examples/calib/<spot|spot2>/calibration.yaml.",
     )
     return parser.parse_args()
 
 
-def robot_label(ip: str) -> str:
-    return ROBOT_NAMES.get(ip, ip)
+def robot_name(ip: str) -> str:
+    info = ROBOT_INFO.get(ip)
+    return info[0] if info else ip
+
+
+def calib_path_for(ip: str, override: str | None) -> str | None:
+    if override:
+        return override
+    info = ROBOT_INFO.get(ip)
+    if info is None:
+        return None
+    path = _CALIB_ROOT / info[1] / "calibration.yaml"
+    return str(path) if path.exists() else None
 
 
 def to_bgr_uint8(rgb: np.ndarray) -> np.ndarray:
@@ -89,7 +115,7 @@ def make_tile(img_bgr: np.ndarray | None, label: str, tile_w: int, tile_h: int) 
     return np.vstack([banner, body])
 
 
-def fetch_front_rgb(stream, timeout: float) -> dict[CameraType, np.ndarray]:
+def fetch_rgb(stream, timeout: float) -> dict[CameraType, np.ndarray]:
     """Return {camera: corrected BGR uint8} for the latest frame, or {} on timeout."""
     try:
         rgb_images, _depth, _b2w = stream.get_current_images(timeout=timeout, run_pipeline=False)
@@ -100,50 +126,79 @@ def fetch_front_rgb(stream, timeout: float) -> dict[CameraType, np.ndarray]:
     return {cam: to_bgr_uint8(rgb) for cam, rgb in zip(order, rgb_images)}
 
 
+def render_stitch(streams, args, tile_w: int) -> np.ndarray:
+    """One stitched panorama per robot, stacked vertically."""
+    tile_h = int(tile_w * STITCH_OUT_H / STITCH_OUT_W)
+    tiles = []
+    for name, stream in streams:
+        frames = fetch_rgb(stream, args.timeout)
+        tiles.append(make_tile(frames.get(CameraType.FRONTSTITCHED), f"{name} stitched", tile_w, tile_h))
+    return np.vstack(tiles)
+
+
+def render_lr(streams, args, tile_w: int) -> np.ndarray:
+    """Raw tiles, each rotated 90° CW (front cameras are mounted sideways), arranged
+    as one row per robot with right-then-left; robots stacked top to bottom."""
+    # Rotating 90° makes the 640x480 (WxH) frames portrait -> 480x640, so tiles are tall.
+    tile_h = int(tile_w * 640 / 480)
+    rows = []
+    for name, stream in streams:
+        frames = fetch_rgb(stream, args.timeout)
+        robot_tiles = []
+        for cam in (CameraType.FRONTRIGHT, CameraType.FRONTLEFT):
+            img = frames.get(cam)
+            if img is not None:
+                img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+            robot_tiles.append(make_tile(img, f"{name} {cam.name}", tile_w, tile_h))
+        rows.append(np.hstack(robot_tiles))
+    return np.vstack(rows)
+
+
 def main() -> int:
     args = parse_args()
 
-    robots = [("primary", args.robot_ip)]
+    robots = [args.robot_ip]
     if args.secondary_robot_ip:
-        robots.append(("secondary", args.secondary_robot_ip))
+        robots.append(args.secondary_robot_ip)
 
+    stitch_view = args.view == "stitch"
     mask = CameraType(0)
     for cam in FRONT_CAMERAS:
         mask |= cam
+    if stitch_view:
+        mask |= CameraType.FRONTSTITCHED
 
-    tile_w = args.tile_width
-    tile_h = int(tile_w * 480 / 640)  # Spot fisheye frames are 640x480 (WxH)
+    # Sensible default panel width per view (stitched panoramas are wide; rotated
+    # lr tiles are portrait and stacked two-high, so keep them narrow).
+    tile_w = args.tile_width or (960 if stitch_view else 360)
 
     with ExitStack() as stack:
         streams = []
-        for _label, ip in robots:
+        for ip in robots:
             config = SpotConfig(robot_ip=ip, username=args.username, password=args.password)
             conn = stack.enter_context(SpotConnection(config))
             stream = conn.create_cam_stream(stream_id=f"cmp_{ip.replace('.', '_')}")
+            if stitch_view:
+                calib = calib_path_for(ip, args.calib)
+                if calib:
+                    # Read by _cache_stitch_params so the stitch undistorts with the
+                    # fisheye model instead of the naive pinhole fallback.
+                    stream._stitch_calib_path = calib  # noqa: SLF001
+                    logger.info("%s: using fisheye calibration %s", robot_name(ip), calib)
+                else:
+                    logger.warning(
+                        "%s (%s): no calibration.yaml found; stitch falls back to pinhole "
+                        "and the floor may not line up.", robot_name(ip), ip
+                    )
             stream.start_streaming(mask)
-            streams.append((robot_label(ip), stream))
-            logger.info("Streaming front RGB from %s (%s)", robot_label(ip), ip)
+            streams.append((robot_name(ip), stream))
+            logger.info("Streaming front cameras from %s (%s)", robot_name(ip), ip)
 
+        render = render_stitch if stitch_view else render_lr
         try:
             start = time.perf_counter()
             while time.perf_counter() - start < args.duration:
-                rows = []
-                for name, stream in streams:
-                    frames = fetch_front_rgb(stream, args.timeout)
-                    row_tiles = [
-                        make_tile(
-                            frames.get(cam),
-                            f"{name} {cam.name}",
-                            tile_w,
-                            tile_h,
-                        )
-                        for cam in FRONT_CAMERAS
-                    ]
-                    rows.append(np.hstack(row_tiles))
-
-                # 'row': one side-by-side strip; 'grid': one robot per row.
-                canvas = np.hstack(rows) if args.layout == "row" else np.vstack(rows)
-                cv2.imshow(WINDOW, canvas)
+                cv2.imshow(WINDOW, render(streams, args, tile_w))
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     logger.info("User requested quit")
                     break
