@@ -9,62 +9,63 @@ _TUSKER_IP = "128.148.138.22"
 _IDENTITY_3x3 = np.eye(3, dtype=np.float32)
 
 # Color correction matrices per robot, keyed by CameraType.
-# Convention: corrected_pixel = raw_pixel @ M  (row-vector form), applied in numpy as
-# img @ M for (H, W, 3) images, in LINEAR light (camera_stream._apply_ccm_inplace
-# gamma-decodes before and gamma-encodes after).
+# Convention: corrected_pixel = raw_pixel @ M (row-vector), applied in LINEAR light
+# (camera_stream._apply_ccm_inplace gamma-decodes before and encodes after).
 #
-# Re-calibrated 2026-07-21 from ColorChecker Classic (24-patch) shots in
-# calibration/Color_calibration via calibration/calibrate_color.py, which fits in the
-# exact runtime convention above (linear light, RGB order, measured @ M = reference).
-# The previous matrices imposed a strong yellow cast because their fit convention did
-# not match the application; these map neutral patches back to ~neutral. The FRONTLEFT
-# LEFT/RIGHT/BACK fits are the weakest (LEFT charts were dim); front cameras are solid.
+# Re-calibrated 2026-07-21 from ColorChecker Classic shots via
+# calibration/calibrate_color.py, fit in the exact runtime convention. Matrices are
+# LUMINANCE-NORMALIZED: each does white-balance/color only, with no net brightness gain,
+# so the left/right cameras match under live auto-exposure instead of being pushed apart
+# by different per-shot exposure gains. Front-left charts were overexposed (clipped
+# white); clipped patches are excluded from the fit. Front L/R now match to within a few
+# percent in both brightness and color.
+
 _GOUGER_CCMS: dict = {
     CameraType.LEFT: np.array(
         [
-            [2.5854093, -0.4295195, -0.5450053],
-            [-0.5711534, 2.7618423, -0.5600168],
-            [1.0161658, 0.4671633, 4.7618838],
+            [ 0.9252394, -0.1537120, -0.1950408],
+            [-0.2043984,  0.9883794, -0.2004130],
+            [ 0.3636548,  0.1671835,  1.7041334],
         ],
         dtype=np.float32,
     ),
     CameraType.RIGHT: np.array(
         [
-            [1.1426924, -0.0441912, -0.0757772],
-            [-0.3235770, 1.1488461, -0.5509417],
-            [0.3831552, 0.3057888, 2.7248761],
+            [ 0.8909205, -0.0344545, -0.0590811],
+            [-0.2522826,  0.8957184, -0.4295516],
+            [ 0.2987338,  0.2384137,  2.1244983],
         ],
         dtype=np.float32,
     ),
     CameraType.FRONTLEFT: np.array(
         [
-            [1.1310828, -0.0795984, -0.1356487],
-            [-0.3382733, 0.7931441, -0.4522528],
-            [0.1598594, 0.1210474, 1.5402151],
+            [ 1.4045123, -0.0530673, -0.1952778],
+            [-0.2049640,  1.1420682, -0.6814700],
+            [-0.0981464, -0.1402734,  2.0806476],
         ],
         dtype=np.float32,
     ),
     CameraType.FRONTRIGHT: np.array(
         [
-            [2.2394428, -0.0725712, -0.0965767],
-            [-0.7988383, 1.5425588, -0.9948898],
-            [0.6343875, 0.1968048, 3.2447091],
+            [ 1.3131798, -0.0425548, -0.0566313],
+            [-0.4684282,  0.9045362, -0.5833903],
+            [ 0.3719965,  0.1154037,  1.9026547],
         ],
         dtype=np.float32,
     ),
     CameraType.BACK: np.array(
         [
-            [1.6895218, -0.2724246, -0.3340853],
-            [-0.1035392, 1.9946518, -0.6546288],
-            [-0.0058108, -0.3404643, 2.4864767],
+            [ 1.1503872, -0.1854926, -0.2274770],
+            [-0.0704993,  1.3581487, -0.4457336],
+            [-0.0039565, -0.2318205,  1.6930299],
         ],
         dtype=np.float32,
     ),
     CameraType.HAND: np.array(
         [
-            [0.9414168, 0.1957636, 0.1055121],
-            [0.2847702, 0.8804330, 0.1169896],
-            [0.0902970, 0.0698249, 0.7625972],
+            [ 0.6647687,  0.1172762,  0.1298628],
+            [ 0.3291539,  0.8974054,  0.3904490],
+            [ 0.0973162, -0.0223571,  0.4323218],
         ],
         dtype=np.float32,
     ),
@@ -73,49 +74,49 @@ _GOUGER_CCMS: dict = {
 _TUSKER_CCMS: dict = {
     CameraType.LEFT: np.array(
         [
-            [1.1104482, -0.2087157, -0.2830932],
-            [-0.0713021, 1.2482210, -0.0631176],
-            [0.3074766, 0.1108967, 1.3683642],
+            [ 0.8969028, -0.1685785, -0.2286528],
+            [-0.0575903,  1.0081811, -0.0509798],
+            [ 0.2483471,  0.0895706,  1.1052201],
         ],
         dtype=np.float32,
     ),
     CameraType.RIGHT: np.array(
         [
-            [1.0084686, -0.0749468, -0.1089477],
-            [-0.2729980, 0.9138313, -0.3575369],
-            [0.3647113, 0.4341347, 2.3244420],
+            [ 0.9152478, -0.0498978, -0.1057481],
+            [-0.1510789,  0.8989689, -0.3631941],
+            [ 0.1761787,  0.2475585,  2.1410070],
         ],
         dtype=np.float32,
     ),
     CameraType.FRONTLEFT: np.array(
         [
-            [1.2360352, -0.0980153, -0.0903682],
-            [-0.3104880, 1.1048254, -0.4026569],
-            [0.1705118, -0.0686806, 1.5258099],
+            [ 1.1968284, -0.1027325, -0.1031919],
+            [-0.3069350,  1.0696017, -0.4036685],
+            [ 0.2178420, -0.0048895,  1.6136609],
         ],
         dtype=np.float32,
     ),
     CameraType.FRONTRIGHT: np.array(
         [
-            [1.7395239, -0.1910180, -0.1886352],
-            [-0.3797869, 1.6030422, -0.7148027],
-            [0.0952428, -0.2496742, 2.3361831],
+            [ 1.3788048, -0.1514073, -0.1495185],
+            [-0.3010318,  1.2706249, -0.5665765],
+            [ 0.0754926, -0.1979001,  1.8517369],
         ],
         dtype=np.float32,
     ),
     CameraType.BACK: np.array(
         [
-            [1.2387122, -0.0705732, -0.1116748],
-            [-0.6390438, 0.7751563, -0.5702900],
-            [0.6542121, 0.4754602, 2.0767134],
+            [ 1.0942421, -0.0623423, -0.0986502],
+            [-0.5645126,  0.6847504, -0.5037775],
+            [ 0.5779119,  0.4200076,  1.8345079],
         ],
         dtype=np.float32,
     ),
     CameraType.HAND: np.array(
         [
-            [0.9066813, 0.1788848, 0.0981196],
-            [0.3016099, 0.8686880, 0.1277333],
-            [0.0585144, 0.0333907, 0.6599118],
+            [ 0.6786041,  0.1235966,  0.1361107],
+            [ 0.3471191,  0.9044739,  0.3450083],
+            [ 0.0850057, -0.0282933,  0.4408294],
         ],
         dtype=np.float32,
     ),

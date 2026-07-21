@@ -143,11 +143,30 @@ def sample_patches(img_rgb01: np.ndarray, centers: np.ndarray) -> np.ndarray:
     return out
 
 
-def fit_ccm(measured01: np.ndarray, ref_srgb: np.ndarray) -> np.ndarray:
-    """Least-squares 3x3 M with measured_linear @ M ~= reference_linear (runtime convention)."""
+_LUMA_LIN = np.array([0.2126, 0.7152, 0.0722])  # Rec.709 luminance, linear light
+
+
+def fit_ccm(measured01: np.ndarray, ref_srgb: np.ndarray, normalize_luma: bool = True) -> np.ndarray:
+    """Least-squares 3x3 M with measured_linear @ M ~= reference_linear (runtime convention).
+
+    - Patches with a clipped (>0.985) or crushed (<0.02) measured channel are dropped:
+      a linear fit can't trust saturated data, and the front-left charts are overexposed.
+    - normalize_luma scales M so the neutral ramp keeps its own luminance, i.e. the CCM
+      does white-balance/color ONLY and adds no per-shot brightness gain. This is what
+      lets the left/right cameras match: brightness is left to live auto-exposure (which
+      already balances the two) instead of being baked differently into each matrix.
+    """
     meas_lin = srgb_to_linear(measured01)               # (24,3)
     ref_lin = srgb_to_linear(ref_srgb / 255.0)          # (24,3)
-    M, *_ = np.linalg.lstsq(meas_lin, ref_lin, rcond=None)
+    keep = np.all((measured01 > 0.02) & (measured01 < 0.985), axis=1)
+    A, B = (meas_lin[keep], ref_lin[keep]) if int(keep.sum()) >= 8 else (meas_lin, ref_lin)
+    M, *_ = np.linalg.lstsq(A, B, rcond=None)
+    if normalize_luma:
+        grays = srgb_to_linear(measured01[19:23])       # neutral 8/6.5/5/3.5 (skip white/black)
+        in_l = float((grays @ _LUMA_LIN).mean())
+        out_l = float(((grays @ M) @ _LUMA_LIN).mean())
+        if out_l > 1e-6:
+            M = M * (in_l / out_l)
     return M.astype(np.float64)
 
 
