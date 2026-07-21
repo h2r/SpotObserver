@@ -9,8 +9,9 @@ longer shows a brightness step at the seam.
     [ TUSKER  stitched front ]
     [ GOUGER  stitched front ]
 
-Use --view lr to instead see the raw tiles, each rotated 90° clockwise (the front
-cameras are mounted sideways), one row per robot with right-then-left:
+Use --view lr to instead see the left/right tiles, each rotated 90° clockwise (the
+front cameras are mounted sideways) and exposure-matched to each other, one row per
+robot with right-then-left:
 
     [ TUSKER R ][ TUSKER L ]
     [ GOUGER R ][ GOUGER L ]
@@ -35,7 +36,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from pyspotobserver import CameraType, SpotConfig, SpotConnection
-from pyspotobserver.stitch import STITCH_OUT_H, STITCH_OUT_W
+from pyspotobserver.stitch import STITCH_OUT_H, STITCH_OUT_W, _GAIN_LIMITS, _LUMA_WEIGHTS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -97,6 +98,30 @@ def to_bgr_uint8(rgb: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
 
+def match_exposure(
+    bgr_l: np.ndarray | None, bgr_r: np.ndarray | None
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Scale the darker of the two BGR uint8 tiles up to the brighter by mean
+    luminance, so the independently auto-exposed front cameras look consistent side
+    by side. Same idea as stitch._match_gain, but measured over the whole frame since
+    the raw tiles share no overlapping FOV. No-op if either side is missing or black.
+    """
+    if bgr_l is None or bgr_r is None:
+        return bgr_l, bgr_r
+    w = _LUMA_WEIGHTS[::-1]  # _LUMA_WEIGHTS is RGB order; these tiles are BGR
+    lum_l = float((bgr_l.astype(np.float32) * w).sum(axis=2).mean())
+    lum_r = float((bgr_r.astype(np.float32) * w).sum(axis=2).mean())
+    if lum_l <= 1e-4 or lum_r <= 1e-4:
+        return bgr_l, bgr_r
+    if lum_l < lum_r:
+        gain = float(np.clip(lum_r / lum_l, *_GAIN_LIMITS))
+        bgr_l = np.clip(bgr_l.astype(np.float32) * gain, 0, 255).astype(np.uint8)
+    else:
+        gain = float(np.clip(lum_l / lum_r, *_GAIN_LIMITS))
+        bgr_r = np.clip(bgr_r.astype(np.float32) * gain, 0, 255).astype(np.uint8)
+    return bgr_l, bgr_r
+
+
 def make_tile(img_bgr: np.ndarray | None, label: str, tile_w: int, tile_h: int) -> np.ndarray:
     """Resize to (tile_w, tile_h) and add a text banner on top."""
     if img_bgr is None:
@@ -144,9 +169,12 @@ def render_lr(streams, args, tile_w: int) -> np.ndarray:
     rows = []
     for name, stream in streams:
         frames = fetch_rgb(stream, args.timeout)
+        # Balance the two independently auto-exposed cameras before tiling.
+        left, right = match_exposure(
+            frames.get(CameraType.FRONTLEFT), frames.get(CameraType.FRONTRIGHT)
+        )
         robot_tiles = []
-        for cam in (CameraType.FRONTRIGHT, CameraType.FRONTLEFT):
-            img = frames.get(cam)
+        for cam, img in ((CameraType.FRONTRIGHT, right), (CameraType.FRONTLEFT, left)):
             if img is not None:
                 img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
             robot_tiles.append(make_tile(img, f"{name} {cam.name}", tile_w, tile_h))
