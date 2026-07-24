@@ -1205,15 +1205,25 @@ class SpotCamStream:
         Estimates the illuminant per channel as the Minkowski-p mean e_c = (mean(I_c^p))^(1/p)
         (p=1 is gray-world, p->inf is white-patch; p=6 is a robust middle ground that keys off
         the brighter/whiter pixels without betting everything on specular highlights). Scales each
-        channel by e.mean()/e_c so the overall level is preserved and only the colour cast is
-        removed. This runs AFTER the CCM to neutralise the residual per-camera cast (e.g. the
-        front-right pink) that the fixed CCM can't track as the cameras auto-WB per scene.
-        Empirically (compare_wb.py) this removes the pink where gray-world under-corrects."""
+        channel by e.mean()/e_c to neutralise the cast. This runs AFTER the CCM to remove the
+        residual per-camera cast (e.g. the front-right pink) that the fixed CCM can't track as
+        the cameras auto-WB per scene. Empirically (compare_wb.py) this removes the pink where
+        gray-world under-corrects.
+
+        LUMINANCE-PRESERVING: after the colour gains, the frame is rescaled so its mean luma is
+        unchanged, so the AWB only shifts COLOUR, never brightness. Without this, a bright light/
+        highlight in one camera's view inflates its illuminant estimate and darkens the whole
+        frame (the 'front-left is darker' artifact)."""
         flat = img.reshape(-1, 3)
+        luma = np.array([0.299, 0.587, 0.114], dtype=img.dtype)
+        l0 = float((flat @ luma).mean())                           # mean luma before
         e = np.power(np.mean(np.power(flat, p), axis=0), 1.0 / p)   # (3,) per-channel illuminant
         e = np.maximum(e, 1e-6)
         gains = (e.mean() / e).astype(img.dtype)
-        np.multiply(img, gains, out=img)
+        np.multiply(img, gains, out=img)                           # colour-neutralise
+        l1 = float((flat @ luma).mean())                           # mean luma after (flat views img)
+        if l1 > 1e-6:
+            np.multiply(img, l0 / l1, out=img)                     # restore original brightness
         np.clip(img, 0.0, 1.0, out=img)
 
     def _correct_color_inplace(self, img: np.ndarray, ccm: np.ndarray | None) -> None:

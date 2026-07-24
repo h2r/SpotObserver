@@ -15,7 +15,7 @@ front cameras are mounted sideways), one row per robot with right-then-left:
     [ TUSKER R ][ TUSKER L ]
     [ GOUGER R ][ GOUGER L ]
 
-RGB only (no depth). Keys: 'q' quit; 'c' toggle per-camera color calibration (CCM)
+RGB only (no depth). Keys: 'q' quit; 'w' toggle per-frame AWB; 'c' toggle per-camera color calibration (CCM)
 off/on (calibrated vs raw); 'm' toggle the live match of the right front camera to the
 left (color + brightness), which cleans up the residual pink/exposure a fixed CCM can't.
 
@@ -272,6 +272,11 @@ def main() -> int:
                 if key == ord("m"):
                     args.match_lr = not args.match_lr
                     logger.info("Live right->left match %s", "ON" if args.match_lr else "OFF")
+                if key == ord("w"):
+                    for _name, stream in streams:
+                        stream._awb_enabled = not stream._awb_enabled  # noqa: SLF001
+                    awb_on = streams[0][1]._awb_enabled if streams else False  # noqa: SLF001
+                    logger.info("Per-frame AWB %s", "ON" if awb_on else "OFF")
         finally:
             for _name, stream in streams:
                 stream.stop_streaming()
