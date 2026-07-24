@@ -154,8 +154,13 @@ def _make_view(args):
     import open3d as o3d
     vis = o3d.visualization.Visualizer()
     vis.create_window("two-robot colored ICP (robot1=red, robot2=blue)", width=1280, height=720)
-    vis.get_render_option().point_size = args.point_size
+    # Add geometry BEFORE touching the render option: on macOS get_render_option() returns None
+    # until the renderer is initialised by a first add_geometry, so setting point_size early
+    # crashes with 'NoneType has no attribute point_size'.
     vis.add_geometry(o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2))
+    ro = vis.get_render_option()
+    if ro is not None:                                      # still guard: headless/GL failure -> None
+        ro.point_size = args.point_size
     disp = o3d.geometry.PointCloud()                        # merged cloud, re-filled each frame
     return vis, disp
 
