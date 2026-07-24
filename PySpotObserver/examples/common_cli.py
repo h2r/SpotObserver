@@ -51,6 +51,12 @@ def add_common_connection_arguments(
             type=int,
             help="Frame buffer size. Overrides the config file when provided.",
         )
+    parser.add_argument(
+        "--awb",
+        action="store_true",
+        help="Apply a per-frame shades-of-gray auto white balance after the CCM, neutralizing "
+        "the residual per-camera colour cast (e.g. front-right pink) the fixed CCM can't track.",
+    )
 
 
 def add_stream_arguments(
@@ -113,6 +119,9 @@ def build_config_from_args(args: argparse.Namespace) -> SpotConfig:
         raise ValueError("dumps_enabled specified without save_dir")
     elif args.dumps_enabled:
         config.dumps_enabled = True
+
+    if getattr(args, "awb", False):
+        config.awb_enabled = True
     if args.save_dir:
         config.save_dir = args.save_dir
 

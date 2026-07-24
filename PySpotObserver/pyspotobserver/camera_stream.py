@@ -24,10 +24,12 @@ from .stitch import (
     STITCH_OUT_H,
     STITCH_OUT_W,
     CamStitchParams,
+    attach_fisheye_calibration,
     compute_stitch,
     extract_btw_params,
     extract_ctb_params,
     extract_stitch_params,
+    load_fisheye_calibration,
 )
 
 if TYPE_CHECKING:
@@ -58,6 +60,10 @@ class ImageFrame:
         timestamp: Time when frame was captured (monotonic clock)
         acquisition_time: Robot's acquisition time from image response
         body_to_world: Body poses in the vision/world frame aligned with _sdk_camera_order
+        exposure_gain: Per-camera exposure_duration_s * gain (from each RGB response's
+            capture_params), aligned with _sdk_camera_order. The exact scale the camera's
+            auto-exposure applied this frame; use ref/eg to put cameras on one radiance
+            scale. 0.0 for a camera that reported no capture_params (e.g. hand cam).
         frame_id: Monotonic frame index assigned by the producer thread. Used to
             key dumped files so producer-side (RGB/depth/pose) and consumer-side
             (pipeline output) dumps for the same capture share a filename.
@@ -69,6 +75,7 @@ class ImageFrame:
     timestamp: float
     acquisition_time: float | None = None
     body_to_world: list[np.ndarray] | None = None
+    exposure_gain: list[float] | None = None
     frame_id: int = 0
 
 
@@ -111,6 +118,8 @@ class SpotCamStream:
         self._config = config
         self._stream_id = stream_id
         self.dumps_enabled = config.dumps_enabled
+        # Per-frame shades-of-gray AWB applied AFTER the CCM (opt-in; default off).
+        self._awb_enabled = bool(getattr(config, "awb_enabled", False))
         self.save_dir = (
             os.path.join(
                 config.save_dir,
@@ -380,6 +389,7 @@ class SpotCamStream:
         copy: bool = False,
         run_pipeline: bool = False,
         dump: bool = True,
+        include_exposure: bool = False,
     ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
         """
         Get the most recent frame of images.
@@ -397,7 +407,8 @@ class SpotCamStream:
         Returns:
             Tuple of (rgb_images, depth_images, b2w). RGB/depth lists are in camera_order.
                 b2w is in SDK camera order, which matches camera_order except virtual cameras
-                such as FRONTSTITCHED are omitted.
+                such as FRONTSTITCHED are omitted. If include_exposure=True, a 4th element
+                (exposure_gain, per-camera exp_s*gain in SDK order, or None) is appended.
 
         Raises:
             SpotCamStreamError: If not streaming or timeout occurs
@@ -447,6 +458,9 @@ class SpotCamStream:
                     f"b2w received. length {len(b2w)}, shape(s): {b2w_shapes}, sample b2w: {b2w[0]}"
                 )
 
+                if include_exposure:
+                    eg = list(frame.exposure_gain) if frame.exposure_gain is not None else None
+                    return rgb, depth, b2w, eg
                 return rgb, depth, b2w
 
             wait_timeout = poll_interval
@@ -492,6 +506,9 @@ class SpotCamStream:
                 f"b2w received. length {len(b2w)}, shape(s): {b2w_shapes}, sample b2w: {b2w[0]}"
             )
 
+            if include_exposure:
+                eg = list(frame.exposure_gain) if frame.exposure_gain is not None else None
+                return rgb, depth, b2w, eg
             return rgb, depth, b2w
 
     async def async_get_current_images(
@@ -882,8 +899,10 @@ class SpotCamStream:
             rgb_idx = i * 2
             depth_idx = i * 2 + 1
             rgb = self._convert_image_response_alloc(responses[rgb_idx], is_depth=False)
-            if self._ccms is not None:
-                self._apply_ccm_inplace(rgb, self._ccms[self._sdk_camera_order[i]])
+            self._correct_color_inplace(
+                rgb,
+                self._ccms[self._sdk_camera_order[i]] if self._ccms is not None else None,
+            )
             decoded.append(rgb)
             decoded.append(self._convert_image_response_alloc(responses[depth_idx], is_depth=True))
         return decoded
@@ -894,6 +913,28 @@ class SpotCamStream:
         fr_sdk_i = self._sdk_camera_order.index(CameraType.FRONTRIGHT)
         self._stitch_params_l = extract_stitch_params(responses[fl_sdk_i * 2])
         self._stitch_params_r = extract_stitch_params(responses[fr_sdk_i * 2])
+
+        # Optionally overlay fisheye (Kannala-Brandt) calibration so the point
+        # cloud is unprojected with the correct lens model instead of a naive
+        # pinhole. Set self._stitch_calib_path (e.g. from config) to a
+        # calibrate_fisheye.py calibration.yaml to enable; otherwise stitching
+        # falls back to the SDK pinhole intrinsics as before.
+        calib_path = getattr(self, "_stitch_calib_path", None)
+        if calib_path:
+            try:
+                calib = load_fisheye_calibration(str(calib_path))
+                attach_fisheye_calibration(self._stitch_params_l, *calib["frontleft"])
+                attach_fisheye_calibration(self._stitch_params_r, *calib["frontright"])
+                logger.info(
+                    f"Stream '{self._stream_id}': Applied fisheye calibration "
+                    f"from {calib_path}"
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                logger.warning(
+                    f"Stream '{self._stream_id}': Could not load fisheye "
+                    f"calibration ({exc}); using SDK pinhole intrinsics."
+                )
+
         logger.info(f"Stream '{self._stream_id}': Stitch params cached for front cameras")
 
     def _fill_frame_metadata_from_responses(
@@ -923,9 +964,23 @@ class SpotCamStream:
                     frame.body_to_world = None
                 else:
                     frame.body_to_world = [pose.copy() for pose in self._last_body_to_worlds]
+            # Per-camera exposure the auto-exposure actually used (same i*2 = RGB response
+            # indexing as b2w), so consumers can put cameras/robots on one radiance scale.
+            # Isolated in its own guard: this is optional metadata and must NEVER be able to
+            # stall the producer thread, so any failure just leaves exposure_gain = None.
+            try:
+                exposure_gain: list[float] = []
+                for i in range(len(self._sdk_camera_order)):
+                    cp = responses[i * 2].shot.capture_params
+                    exp_s = cp.exposure_duration.seconds + cp.exposure_duration.nanos / 1e9
+                    exposure_gain.append(exp_s * cp.gain)
+                frame.exposure_gain = exposure_gain
+            except Exception:
+                frame.exposure_gain = None
         else:
             frame.acquisition_time = None
             frame.body_to_world = None
+            frame.exposure_gain = None
 
     def _apply_stitch(self, frame: "ImageFrame") -> None:
         """Compute the stitched front view and write it into the FRONTSTITCHED frame slot."""
@@ -1032,12 +1087,7 @@ class SpotCamStream:
                     f"Output array shape mismatch: {out_array.shape} vs {img.shape}"
                 )
             np.multiply(img, 1.0 / 255.0, out=out_array, casting="unsafe")
-            if ccm is not None:
-                self._apply_ccm_inplace(
-                    out_array,
-                    ccm,
-                    scratch=self._get_ccm_scratch(out_array.shape),
-                )
+            self._correct_color_inplace(out_array, ccm)
             return
 
         elif image_proto.format == image_pb2.Image.FORMAT_RAW:
@@ -1077,12 +1127,7 @@ class SpotCamStream:
                             f"Output array shape mismatch: {out_array.shape} vs {img.shape}"
                         )
                     np.multiply(img, 1.0 / 255.0, out=out_array, casting="unsafe")
-                    if ccm is not None:
-                        self._apply_ccm_inplace(
-                            out_array,
-                            ccm,
-                            scratch=self._get_ccm_scratch(out_array.shape),
-                        )
+                    self._correct_color_inplace(out_array, ccm)
                     return
 
                 elif pixel_format == image_pb2.Image.PIXEL_FORMAT_RGBA_U8:
@@ -1095,12 +1140,7 @@ class SpotCamStream:
                             f"Output array shape mismatch: {out_array.shape} vs {img.shape}"
                         )
                     np.multiply(img, 1.0 / 255.0, out=out_array, casting="unsafe")
-                    if ccm is not None:
-                        self._apply_ccm_inplace(
-                            out_array,
-                            ccm,
-                            scratch=self._get_ccm_scratch(out_array.shape),
-                        )
+                    self._correct_color_inplace(out_array, ccm)
                     return
 
                 elif pixel_format == image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U8:
@@ -1114,12 +1154,7 @@ class SpotCamStream:
                     np.multiply(img, 1.0 / 255.0, out=channel, casting="unsafe")
                     out_array[:, :, 1] = channel
                     out_array[:, :, 2] = channel
-                    if ccm is not None:
-                        self._apply_ccm_inplace(
-                            out_array,
-                            ccm,
-                            scratch=self._get_ccm_scratch(out_array.shape),
-                        )
+                    self._correct_color_inplace(out_array, ccm)
                     return
 
                 else:
@@ -1162,6 +1197,42 @@ class SpotCamStream:
         img[low] *= 12.92
         img[~low] = 1.055 * img[~low] ** (1.0 / 2.4) - 0.055
         np.clip(img, 0.0, 1.0, out=img)
+
+    @staticmethod
+    def _apply_shades_of_gray_inplace(img: np.ndarray, p: int = 6) -> None:
+        """Per-frame shades-of-gray auto white balance on an (H, W, 3) float32 image, in-place.
+
+        Estimates the illuminant per channel as the Minkowski-p mean e_c = (mean(I_c^p))^(1/p)
+        (p=1 is gray-world, p->inf is white-patch; p=6 is a robust middle ground that keys off
+        the brighter/whiter pixels without betting everything on specular highlights). Scales each
+        channel by e.mean()/e_c to neutralise the cast. This runs AFTER the CCM to remove the
+        residual per-camera cast (e.g. the front-right pink) that the fixed CCM can't track as
+        the cameras auto-WB per scene. Empirically (compare_wb.py) this removes the pink where
+        gray-world under-corrects.
+
+        LUMINANCE-PRESERVING: after the colour gains, the frame is rescaled so its mean luma is
+        unchanged, so the AWB only shifts COLOUR, never brightness. Without this, a bright light/
+        highlight in one camera's view inflates its illuminant estimate and darkens the whole
+        frame (the 'front-left is darker' artifact)."""
+        flat = img.reshape(-1, 3)
+        luma = np.array([0.299, 0.587, 0.114], dtype=img.dtype)
+        l0 = float((flat @ luma).mean())                           # mean luma before
+        e = np.power(np.mean(np.power(flat, p), axis=0), 1.0 / p)   # (3,) per-channel illuminant
+        e = np.maximum(e, 1e-6)
+        gains = (e.mean() / e).astype(img.dtype)
+        np.multiply(img, gains, out=img)                           # colour-neutralise
+        l1 = float((flat @ luma).mean())                           # mean luma after (flat views img)
+        if l1 > 1e-6:
+            np.multiply(img, l0 / l1, out=img)                     # restore original brightness
+        np.clip(img, 0.0, 1.0, out=img)
+
+    def _correct_color_inplace(self, img: np.ndarray, ccm: np.ndarray | None) -> None:
+        """Apply the per-camera CCM (if any) then, when enabled, the per-frame AWB — the single
+        colour-correction choke point so AWB always follows the CCM at every call site."""
+        if ccm is not None:
+            self._apply_ccm_inplace(img, ccm, scratch=self._get_ccm_scratch(img.shape))
+        if self._awb_enabled:
+            self._apply_shades_of_gray_inplace(img)
 
     @staticmethod
     def _valid_camera_mask() -> int:

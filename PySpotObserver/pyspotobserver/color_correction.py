@@ -1,4 +1,5 @@
 import numpy as np
+
 from .config import CameraType
 
 # Known robot IPs
@@ -8,81 +9,117 @@ _TUSKER_IP = "128.148.138.22"
 _IDENTITY_3x3 = np.eye(3, dtype=np.float32)
 
 # Color correction matrices per robot, keyed by CameraType.
-# Convention: corrected_pixel = raw_pixel @ M  (row-vector form),
-# applied in numpy as: img @ M  for (H, W, 3) images.
-# BACK and HAND cameras use identity until calibration data is available.
+# Convention: corrected_pixel = raw_pixel @ M (row-vector), applied in LINEAR light
+# (camera_stream._apply_ccm_inplace gamma-decodes before and encodes after).
+#
+# Re-calibrated 2026-07-21 from ColorChecker Classic shots via
+# calibration/calibrate_color.py, fit in the exact runtime convention. Matrices are
+# LUMINANCE-NORMALIZED: each does white-balance/color only, with no net brightness gain,
+# so the left/right cameras match under live auto-exposure instead of being pushed apart
+# by different per-shot exposure gains. Front-left charts were overexposed (clipped
+# white); clipped patches are excluded from the fit. Front L/R now match to within a few
+# percent in both brightness and color.
+
 _GOUGER_CCMS: dict = {
     CameraType.LEFT: np.array(
         [
-            [1.4980662, -0.0707718, -0.0458571],
-            [-0.4865953, 0.8866953, -0.4204259],
-            [0.5937464, 0.3074408, 1.1898727],
+            [ 0.9252394, -0.1537120, -0.1950408],
+            [-0.2043984,  0.9883794, -0.2004130],
+            [ 0.3636548,  0.1671835,  1.7041334],
         ],
         dtype=np.float32,
     ),
     CameraType.RIGHT: np.array(
         [
-            [2.1307423, 0.1372727, 0.0647798],
-            [0.0568109, 1.8951481, -0.4296177],
-            [0.5981083, 0.3732290, 2.0813310],
+            [ 0.8909205, -0.0344545, -0.0590811],
+            [-0.2522826,  0.8957184, -0.4295516],
+            [ 0.2987338,  0.2384137,  2.1244983],
         ],
         dtype=np.float32,
     ),
     CameraType.FRONTLEFT: np.array(
         [
-            [1.4337976, -0.1356816, -0.1389128],
-            [-0.3111499, 0.9810063, -0.2869629],
-            [0.3030030, 0.0814753, 0.9887888],
+            [ 1.4045123, -0.0530673, -0.1952778],
+            [-0.2049640,  1.1420682, -0.6814700],
+            [-0.0981464, -0.1402734,  2.0806476],
         ],
         dtype=np.float32,
     ),
     CameraType.FRONTRIGHT: np.array(
         [
-            [2.9136648, -0.0958534, -0.0561581],
-            [-0.5915730, 1.7521565, -0.7878229],
-            [0.6022132, 0.1194339, 1.6545299],
+            [ 1.3131798, -0.0425548, -0.0566313],
+            [-0.4684282,  0.9045362, -0.5833903],
+            [ 0.3719965,  0.1154037,  1.9026547],
         ],
         dtype=np.float32,
     ),
-    CameraType.BACK: _IDENTITY_3x3,
-    CameraType.HAND: _IDENTITY_3x3,
+    CameraType.BACK: np.array(
+        [
+            [ 1.1503872, -0.1854926, -0.2274770],
+            [-0.0704993,  1.3581487, -0.4457336],
+            [-0.0039565, -0.2318205,  1.6930299],
+        ],
+        dtype=np.float32,
+    ),
+    CameraType.HAND: np.array(
+        [
+            [ 0.6647687,  0.1172762,  0.1298628],
+            [ 0.3291539,  0.8974054,  0.3904490],
+            [ 0.0973162, -0.0223571,  0.4323218],
+        ],
+        dtype=np.float32,
+    ),
 }
 
 _TUSKER_CCMS: dict = {
     CameraType.LEFT: np.array(
         [
-            [1.8952084, -0.0917113, -0.1345257],
-            [-0.2042349, 1.4999812, -0.4616307],
-            [0.3097906, 0.0590297, 1.4913727],
+            [ 0.8969028, -0.1685785, -0.2286528],
+            [-0.0575903,  1.0081811, -0.0509798],
+            [ 0.2483471,  0.0895706,  1.1052201],
         ],
         dtype=np.float32,
     ),
     CameraType.RIGHT: np.array(
         [
-            [1.5771384, -0.0511120, -0.0410739],
-            [-0.6573969, 0.9523082, -0.5956711],
-            [0.3767823, 0.3439774, 1.8481518],
+            [ 0.9152478, -0.0498978, -0.1057481],
+            [-0.1510789,  0.8989689, -0.3631941],
+            [ 0.1761787,  0.2475585,  2.1410070],
         ],
         dtype=np.float32,
     ),
     CameraType.FRONTLEFT: np.array(
         [
-            [2.1959698, 0.0050106, -0.0217284],
-            [-0.3654362, 1.3668996, -0.4870523],
-            [0.5744365, 0.2933731, 1.5111261],
+            [ 1.1968284, -0.1027325, -0.1031919],
+            [-0.3069350,  1.0696017, -0.4036685],
+            [ 0.2178420, -0.0048895,  1.6136609],
         ],
         dtype=np.float32,
     ),
     CameraType.FRONTRIGHT: np.array(
         [
-            [3.1622671, -0.1799195, -0.1370601],
-            [-0.8215924, 2.0136070, -0.9268775],
-            [0.4902452, -0.0647052, 2.0256366],
+            [ 1.3788048, -0.1514073, -0.1495185],
+            [-0.3010318,  1.2706249, -0.5665765],
+            [ 0.0754926, -0.1979001,  1.8517369],
         ],
         dtype=np.float32,
     ),
-    CameraType.BACK: _IDENTITY_3x3,
-    CameraType.HAND: _IDENTITY_3x3,
+    CameraType.BACK: np.array(
+        [
+            [ 1.0942421, -0.0623423, -0.0986502],
+            [-0.5645126,  0.6847504, -0.5037775],
+            [ 0.5779119,  0.4200076,  1.8345079],
+        ],
+        dtype=np.float32,
+    ),
+    CameraType.HAND: np.array(
+        [
+            [ 0.6786041,  0.1235966,  0.1361107],
+            [ 0.3471191,  0.9044739,  0.3450083],
+            [ 0.0850057, -0.0282933,  0.4408294],
+        ],
+        dtype=np.float32,
+    ),
 }
 
 _ROBOT_CCMS: dict = {

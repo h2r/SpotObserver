@@ -96,6 +96,11 @@ class SpotConfig:
     save_dir: str | None = None
     """If ``dumps_enabled``, save data to this directory."""
 
+    awb_enabled: bool = False
+    """Apply a per-frame shades-of-gray auto white balance to each RGB image AFTER the CCM.
+    Neutralizes the residual per-camera colour cast (e.g. front-right pink) that the fixed CCM
+    can't track as the cameras auto-white-balance per scene. Default False (raw CCM output)."""
+
     extra_params: dict[str, Any] = field(default_factory=dict)
     """Additional user-defined parameters"""
 
@@ -155,6 +160,7 @@ class SpotConfig:
             "connection_retry_delay_ms": self.connection_retry_delay_ms,
             "dumps_enabled": self.dumps_enabled,
             "save_dir": self.save_dir,
+            "awb_enabled": self.awb_enabled,
         }
 
         data = {key: value for key, value in data.items() if value is not None}
