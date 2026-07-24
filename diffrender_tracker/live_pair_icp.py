@@ -161,6 +161,12 @@ def _make_view(args):
     ro = vis.get_render_option()
     if ro is not None:                                      # still guard: headless/GL failure -> None
         ro.point_size = args.point_size
+    # macOS: the window only maps once its event loop is pumped. Our per-frame ingest+ICP takes
+    # ~1-2s, long enough that the OS never shows the window before the first poll and poll_events()
+    # then returns False ("closed") spuriously. Pump it a few times here so it actually appears.
+    for _ in range(30):
+        vis.poll_events()
+        vis.update_renderer()
     disp = o3d.geometry.PointCloud()                        # merged cloud, re-filled each frame
     return vis, disp
 
@@ -182,8 +188,12 @@ def _update_view(vis, disp, added, xyz_a, rgb_a, b_posed, rgb_b, view_rgb):
         added = True
     else:
         vis.update_geometry(disp)
-    alive = vis.poll_events()
-    vis.update_renderer()
+    # Pump the loop several times: one poll per ~1-2s frame leaves a macOS window unresponsive.
+    # A genuinely closed window returns False on every pump; an open one returns True at least once.
+    alive = False
+    for _ in range(5):
+        alive = vis.poll_events() or alive
+        vis.update_renderer()
     return alive, added
 
 
@@ -208,6 +218,7 @@ def main() -> int:
 
         vis, disp = _make_view(args) if args.view else (None, None)
         view_added = False
+        view_alive_once = False                             # only a genuine close (after showing) stops us
 
         T_good = np.eye(4, dtype=np.float32)
         have_lock = False
@@ -250,7 +261,10 @@ def main() -> int:
             if vis is not None:
                 alive, view_added = _update_view(vis, disp, view_added, xyz_a, rgb_a,
                                                  b_posed, rgb_b, args.view_rgb)
-                if not alive:
+                view_alive_once = view_alive_once or alive
+                # ignore a spurious first False (window still mapping); only stop once it has
+                # actually been shown and the user then closes it.
+                if view_alive_once and not alive:
                     print("   view window closed — stopping.")
                     break
 
