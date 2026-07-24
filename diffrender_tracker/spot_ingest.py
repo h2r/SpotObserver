@@ -66,6 +66,30 @@ def balance_intensity(col_list):
     return out
 
 
+# Shared reference exposure (exp_s * gain) so normalize_exposure puts BOTH robots on one
+# radiance scale. ~the front cameras' measured exp*gain (probe_exposure.py). Must be the same
+# constant for every SpotCloudSource in a run, or a per-robot offset creeps back in.
+NOMINAL_EG = 0.19
+
+
+def normalize_exposure(col_list, eg_list, ref=NOMINAL_EG):
+    """Metadata-exact brightness match: scale each camera's colors by ref/(exp_s*gain), the
+    inverse of the auto-exposure the camera actually applied. Two cameras (or two robots) that
+    saw the same surface then land on one radiance scale — no free parameters, no gray-world
+    assumption. This is the ALTERNATIVE to balance_intensity's luminance match (don't stack:
+    balance_intensity re-matches means and would undo this). Unlike balance_intensity it does
+    NOT touch colour cast — the CCM owns that. A camera reporting eg<=0 (e.g. hand cam, or a
+    frame with no capture_params) passes through untouched.
+
+    `col_list`: list of (Ni,3) colors, one per camera. `eg_list`: matching exp_s*gain per camera.
+    Returns the scaled list."""
+    out = []
+    for c, e in zip(col_list, eg_list):
+        c = np.asarray(c, np.float32)
+        out.append(np.clip(c * (ref / e), 0.0, 1.0) if e and e > 0 else c)
+    return out
+
+
 def voxel_downsample(xyz, rgb, target=20000, min_voxel=0.01):
     """Voxel-grid downsample toward ~`target` points. Picks a voxel size from the bbox volume
     and point budget; returns (xyz, rgb) float32. Uses open3d if available, else passes through."""
@@ -242,7 +266,8 @@ class SpotCloudSource:
 
     def __init__(self, config, calib, camera_mask, cameras=("frontleft", "frontright"),
                  stream_id="diffrender_ingest", stride=2, min_depth=0.2, max_depth=3.0,
-                 target=20000, balance_lr=True, color=False):
+                 target=20000, balance_lr=True, color=False, bright_mode=None,
+                 exposure_ref=NOMINAL_EG):
         self.config = config
         self.calib = calib
         self.camera_mask = camera_mask
@@ -254,6 +279,15 @@ class SpotCloudSource:
         self.target = target
         self.balance_lr = balance_lr        # normalise frontleft/frontright luminance at fuse
         self.color = color                  # keep RGB (True) or collapse to grayscale (False)
+        # How to reconcile brightness across cameras/robots at fuse time:
+        #   "balance"  gray-world per-channel mean/std match (balance_intensity) — also fixes
+        #              colour seam, but estimates brightness from pixels (content-confounded).
+        #   "exposure" metadata-exact exp*gain normalisation (normalize_exposure) — luminance
+        #              only, no free params; the shared exposure_ref ties the two robots together.
+        #   "none"     leave each camera as-is.
+        # Default preserves the old behaviour (balance if balance_lr else none).
+        self.bright_mode = bright_mode or ("balance" if balance_lr else "none")
+        self.exposure_ref = exposure_ref
         self._conn_cm = self._conn = self._stream = self._order = None
         self.last_b2w = None
 
@@ -278,12 +312,14 @@ class SpotCloudSource:
         """Newest frame -> (xyz Nx3 f32, rgb Nx3 f32 [0,1]) in the frontleft frame, or None if
         no valid points this frame. RGB when color=True, else grayscale (channels equal). Stores
         body_to_world in self.last_b2w."""
-        rgb_list, depth_list, b2w = self._stream.get_current_images(
-            timeout=timeout, run_pipeline=False, copy=True)
+        rgb_list, depth_list, b2w, eg = self._stream.get_current_images(
+            timeout=timeout, run_pipeline=False, copy=True, include_exposure=True)
         self.last_b2w = b2w
         imgs = {self._order[i]: (rgb_list[i], depth_list[i]) for i in range(len(self._order))}
+        eg_by_name = ({self._order[i]: eg[i] for i in range(min(len(self._order), len(eg)))}
+                      if eg is not None else {})
         Rlr, Tlr = self.calib["R"], self.calib["T"]
-        pts_all, col_all = [], []
+        pts_all, col_all, eg_used = [], [], []
         for nm in self.cameras:
             if nm not in imgs:
                 continue
@@ -297,9 +333,12 @@ class SpotCloudSource:
             if len(pts):
                 pts_all.append(pts)
                 col_all.append(cols)
+                eg_used.append(eg_by_name.get(nm, 0.0))   # exp*gain for this camera (0 = unknown)
         if not pts_all:
             return None
-        if self.balance_lr and len(col_all) > 1:
+        if self.bright_mode == "exposure":
+            col_all = normalize_exposure(col_all, eg_used, ref=self.exposure_ref)
+        elif self.bright_mode == "balance" and len(col_all) > 1:
             col_all = balance_intensity(col_all)          # kill the frontleft/right seam (per-channel)
         xyz = np.vstack(pts_all)
         rgb = np.vstack(col_all)

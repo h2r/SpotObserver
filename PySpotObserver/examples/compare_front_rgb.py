@@ -88,6 +88,12 @@ def parse_args() -> argparse.Namespace:
         help="Override fisheye calibration.yaml path (applies to all robots). "
         "By default each known robot uses examples/calib/<spot|spot2>/calibration.yaml.",
     )
+    parser.add_argument(
+        "--awb",
+        action="store_true",
+        help="Apply a per-frame shades-of-gray auto white balance after the CCM, neutralizing "
+        "the residual per-camera colour cast (e.g. front-right pink) the fixed CCM can't track.",
+    )
     return parser.parse_args()
 
 
@@ -220,7 +226,8 @@ def main() -> int:
     with ExitStack() as stack:
         streams = []
         for ip in robots:
-            config = SpotConfig(robot_ip=ip, username=args.username, password=args.password)
+            config = SpotConfig(robot_ip=ip, username=args.username, password=args.password,
+                                awb_enabled=args.awb)
             conn = stack.enter_context(SpotConnection(config))
             stream = conn.create_cam_stream(stream_id=f"cmp_{ip.replace('.', '_')}")
             if stitch_view:

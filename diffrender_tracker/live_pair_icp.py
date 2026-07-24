@@ -83,6 +83,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--voxel", type=float, default=0.05, help="ICP coarse voxel / scale (m).")
     p.add_argument("--color", action="store_true",
                    help="Keep CCM-corrected RGB (default grayscale). Also honours DIFFRENDER_COLOR=1.")
+    p.add_argument("--bright-mode", choices=("balance", "exposure", "none"), default="balance",
+                   help="How to reconcile brightness across the two robots' clouds: "
+                        "'balance' = gray-world mean/std match (default, also fixes colour seam); "
+                        "'exposure' = metadata-exact exp*gain normalisation (parameter-free, "
+                        "shared ref via --exposure-ref); 'none' = raw. Toggle to A/B compare.")
+    p.add_argument("--exposure-ref", type=float, default=None,
+                   help="Shared reference exp*gain for --bright-mode exposure (default: "
+                        "spot_ingest.NOMINAL_EG). Same value used for BOTH robots.")
     p.add_argument("--no-warm-start", action="store_true",
                    help="Re-seed every frame from identity instead of the previous transform.")
     p.add_argument("--bootstrap-first", action="store_true",
@@ -208,13 +216,16 @@ def main() -> int:
     color = args.color or env_color()
 
     src_kw = dict(cameras=cams, stride=args.stride, min_depth=args.min_depth,
-                  max_depth=args.max_depth, target=args.target, color=color)
+                  max_depth=args.max_depth, target=args.target, color=color,
+                  bright_mode=args.bright_mode)                # SAME mode+ref for both robots
+    if args.exposure_ref is not None:
+        src_kw["exposure_ref"] = args.exposure_ref
 
     with SpotCloudSource(config_a, calib_a, mask, stream_id="pair_a", **src_kw) as srcA, \
          SpotCloudSource(config_b, calib_b, mask, stream_id="pair_b", **src_kw) as srcB:
         print(f"robot1 {config_a.robot_ip} order={srcA._order}  |  "
               f"robot2 {config_b.robot_ip} order={srcB._order}  |  "
-              f"color={color}  warm_start={not args.no_warm_start}")
+              f"color={color}  bright_mode={args.bright_mode}  warm_start={not args.no_warm_start}")
 
         vis, disp = _make_view(args) if args.view else (None, None)
         view_added = False
