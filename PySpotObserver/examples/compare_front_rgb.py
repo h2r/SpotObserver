@@ -124,9 +124,18 @@ def match_right_to_left(
     happen to view very different scenes. Left is left untouched (it's the anchor)."""
     if left_bgr is None or right_bgr is None:
         return right_bgr
-    lmean = left_bgr.reshape(-1, 3).mean(axis=0)
-    rmean = right_bgr.reshape(-1, 3).mean(axis=0)
-    gains = np.clip(lmean / np.clip(rmean, 1e-3, None), 0.3, 3.0)
+    # Match over MID-TONE pixels only, via median. The fisheye frames have large black
+    # floor/out-of-view wedges and blown highlights; a whole-frame mean is dominated by
+    # those and matches badly. Median over 25<luma<235 keeps only usefully-lit pixels.
+    luma = np.array([0.114, 0.587, 0.299], dtype=np.float32)  # BGR -> luminance
+
+    def midtone_median(img: np.ndarray) -> np.ndarray:
+        lum = img.astype(np.float32) @ luma
+        mask = (lum > 25.0) & (lum < 235.0)
+        px = img[mask] if int(mask.sum()) > 500 else img.reshape(-1, 3)
+        return np.median(px.astype(np.float32), axis=0)
+
+    gains = np.clip(midtone_median(left_bgr) / np.clip(midtone_median(right_bgr), 1e-3, None), 0.3, 3.0)
     return np.clip(right_bgr.astype(np.float32) * gains, 0, 255).astype(np.uint8)
 
 

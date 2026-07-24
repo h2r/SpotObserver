@@ -74,6 +74,35 @@ def _multiscale_colored_icp(A, B, T_init, voxel):
     return reg
 
 
+def colored_icp_register(xyz_a, rgb_a, xyz_b, rgb_b, T_init=None, voxel=0.05):
+    """Pure multi-scale COLORED ICP refine of B->A from `T_init` — NO FPFH/RANSAC seed.
+
+    This is the feature-free path: on real captures the RANSAC seed rarely beat plain ICP, and
+    for a REALTIME loop the best seed is the previous frame's transform (temporal warm-start), not
+    a fresh global search every frame. Frame 1 typically seeds from identity (`T_init=None`); after
+    that, pass back the last accepted T. Returns (T_2to1 (4,4) float32, info) with the same overlap
+    fitness proxy `bootstrap_register` reports, so callers can gate on it identically.
+
+    Caveat: with no global seed, ICP only converges if `T_init` already lands B within the ICP
+    basin of A (roughly < ~15-20deg / a fraction of the scene extent). If the two robots start far
+    apart in their own frontleft frames, seed the first frame with `bootstrap_register` once
+    (see live_pair_icp.py --bootstrap-first) and warm-start from there on."""
+    import open3d as o3d
+    A, B = _to_o3d(xyz_a, rgb_a), _to_o3d(xyz_b, rgb_b)
+    T0 = np.eye(4) if T_init is None else np.asarray(T_init, np.float64)
+    icp = _multiscale_colored_icp(A, B, T0, voxel)
+
+    dist = voxel * 1.5
+    A_d, B_d = A.voxel_down_sample(voxel), B.voxel_down_sample(voxel)
+    fit = _overlap_fitness(B_d, A_d, icp.transformation, dist)
+    info = {
+        "icp_fitness": float(icp.fitness),
+        "icp_rmse": float(icp.inlier_rmse),
+        "overlap_fitness": float(fit),          # same proxy as bootstrap_register's chosen fitness
+    }
+    return np.asarray(icp.transformation, dtype=np.float32), info
+
+
 def bootstrap_register(xyz_a, rgb_a, xyz_b, rgb_b, voxel=0.05, min_fitness=0.15, n_ransac=4):
     """Global-register robot-2's cloud (B) onto robot-1's (A) with no prior.
 
