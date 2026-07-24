@@ -57,6 +57,12 @@ from spot_ingest import (                                   # noqa: E402  (needs
 )
 from bootstrap import bootstrap_register, colored_icp_register   # noqa: E402
 
+# Optical frame is X-right/Y-down/Z-forward; flip Y,Z so the cloud sits upright under Open3D's
+# default camera (same constant as examples/live_pointcloud.py).
+VIEW_FLIP = np.array([1.0, -1.0, -1.0])
+TINT_R1 = np.array([0.9, 0.2, 0.2])     # robot-1 = red
+TINT_R2 = np.array([0.2, 0.4, 0.9])     # robot-2 = blue
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
@@ -84,6 +90,12 @@ def parse_args() -> argparse.Namespace:
                         "warm-start with pure colored ICP after. Use if identity is too far off.")
     p.add_argument("--min-overlap", type=float, default=0.15,
                    help="Frames below this overlap fitness aren't committed as the next seed.")
+    p.add_argument("--view", action="store_true",
+                   help="Open a live Open3D window of the merged aligned cloud (updates each frame).")
+    p.add_argument("--view-rgb", action="store_true",
+                   help="With --view, show each robot's true RGB instead of red/blue tint "
+                        "(tint makes misalignment easier to see).")
+    p.add_argument("--point-size", type=float, default=2.0, help="Live-view point size.")
     p.add_argument("--save", type=str, default=None,
                    help="On exit, write the aligned merged cloud (robot1=red, robot2=blue) here.")
     # build_config_from_args reads these two unconditionally.
@@ -137,6 +149,39 @@ def apply_T(T, xyz):
     return xyz @ T[:3, :3].T + T[:3, 3]
 
 
+def _make_view(args):
+    """Open a live Open3D window. Returns (visualizer, merged PointCloud geometry)."""
+    import open3d as o3d
+    vis = o3d.visualization.Visualizer()
+    vis.create_window("two-robot colored ICP (robot1=red, robot2=blue)", width=1280, height=720)
+    vis.get_render_option().point_size = args.point_size
+    vis.add_geometry(o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2))
+    disp = o3d.geometry.PointCloud()                        # merged cloud, re-filled each frame
+    return vis, disp
+
+
+def _update_view(vis, disp, added, xyz_a, rgb_a, b_posed, rgb_b, view_rgb):
+    """Push the merged aligned cloud into the window. Returns (alive, added) — alive is False if
+    the user closed the window; `added` tracks the first add_geometry (pybind geometry can't hold a
+    Python flag, so the caller owns it)."""
+    import open3d as o3d
+    if view_rgb:
+        cols = np.vstack([np.clip(rgb_a, 0, 1), np.clip(rgb_b, 0, 1)])
+    else:
+        cols = np.vstack([np.tile(TINT_R1, (len(xyz_a), 1)), np.tile(TINT_R2, (len(b_posed), 1))])
+    pts = np.vstack([xyz_a, b_posed]) * VIEW_FLIP           # flip into Open3D's view orientation
+    disp.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
+    disp.colors = o3d.utility.Vector3dVector(cols.astype(np.float64))
+    if not added:
+        vis.add_geometry(disp)                             # first frame frames the camera on the cloud
+        added = True
+    else:
+        vis.update_geometry(disp)
+    alive = vis.poll_events()
+    vis.update_renderer()
+    return alive, added
+
+
 def main() -> int:
     args = parse_args()
     calib_a = load_fisheye_calib(resolve_calib(args.calib))
@@ -155,6 +200,9 @@ def main() -> int:
         print(f"robot1 {config_a.robot_ip} order={srcA._order}  |  "
               f"robot2 {config_b.robot_ip} order={srcB._order}  |  "
               f"color={color}  warm_start={not args.no_warm_start}")
+
+        vis, disp = _make_view(args) if args.view else (None, None)
+        view_added = False
 
         T_good = np.eye(4, dtype=np.float32)
         have_lock = False
@@ -191,9 +239,19 @@ def main() -> int:
             print(f"[{k:03d}] {mode} fit {info['icp_fitness']:.2f}  rmse {info['icp_rmse']*100:4.1f} cm"
                   f"  overlap {ov*100:3.0f}%  {len(xyz_a):5d}/{len(xyz_b):5d} pts"
                   f"  {dt*1000:5.0f} ms{note}")
-            last = (xyz_a, apply_T(T_good, xyz_b))
+            b_posed = apply_T(T_good, xyz_b)
+            last = (xyz_a, b_posed)
+
+            if vis is not None:
+                alive, view_added = _update_view(vis, disp, view_added, xyz_a, rgb_a,
+                                                 b_posed, rgb_b, args.view_rgb)
+                if not alive:
+                    print("   view window closed — stopping.")
+                    break
 
         print(f"\ndone: {n_locked}/{args.frames} frames accepted (overlap >= {args.min_overlap}).")
+        if vis is not None:
+            vis.destroy_window()
         if args.save and last is not None:
             save_merged(args.save, last[0], last[1])
             print("   open it — red (robot1) should sit on the same surfaces as blue (robot2).")
